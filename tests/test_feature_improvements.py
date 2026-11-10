@@ -178,6 +178,51 @@ class FeatureImprovementTests(unittest.TestCase):
             self.assertEqual(len(inputs["laps"]), len(self.laps))
             features.build_features(self.results, stage="post_fp", **inputs)
 
+    def test_qualifying_gap_compares_the_same_phase_not_mixed_q1_q3_conditions(self):
+        data = self.results.copy()
+        data["Q2"] = pd.Series(pd.NaT, index=data.index, dtype="timedelta64[ns]")
+        data["Q3"] = pd.Series(pd.NaT, index=data.index, dtype="timedelta64[ns]")
+        own = data.SessionType.eq("Q") & data.Abbreviation.eq("NEW")
+        mate = data.SessionType.eq("Q") & data.Abbreviation.eq("MAT")
+        data.loc[own, "Q2"] = pd.Timedelta(seconds=101)
+        data.loc[mate, "Q2"] = pd.Timedelta(seconds=100)
+        data.loc[mate, "Q3"] = pd.Timedelta(seconds=70)
+        row = self.row(results=data)
+        self.assertEqual(row["quali_reference_phase"], 2)
+        self.assertAlmostEqual(row["quali_gap_to_pole_pct"], 1.0)
+
+    def test_dirty_practice_laps_do_not_improve_pace(self):
+        laps = self.laps.assign(Deleted=False, IsAccurate=True, TrackStatus="1", PitInTime=pd.NaT)
+        baseline = features.build_features(self.results, laps=laps)["R"].query("Year == 2026 and Abbreviation == 'NEW'").iloc[0]
+        dirty = []
+        for column, value in (("Deleted", True), ("IsAccurate", False), ("TrackStatus", "2"),
+                              ("PitInTime", pd.Timedelta(seconds=50))):
+            lap = laps.iloc[0].copy()
+            lap["LapTime"] = pd.Timedelta(seconds=1)
+            lap[column] = value
+            dirty.append(lap)
+        augmented = pd.concat([laps, pd.DataFrame(dirty)], ignore_index=True)
+        row = features.build_features(self.results, laps=augmented)["R"].query("Year == 2026 and Abbreviation == 'NEW'").iloc[0]
+        for column in ("fp_best_lap_gap_pct", "fp2_long_run_pace_rank", "fp2_long_run_pace_sample_count"):
+            self.assertEqual(row[column], baseline[column])
+
+    def test_nonoverlapping_track_time_cohorts_do_not_invent_long_run_comparability(self):
+        laps = self.laps.copy()
+        laps["Time"] = pd.to_timedelta(np.where(laps.Driver.eq("NEW"), 60, 1860), unit="s")
+        row = features.build_features(self.results, laps=laps)["R"].query("Year == 2026 and Abbreviation == 'NEW'").iloc[0]
+        self.assertEqual(row["fp2_long_run_pace_rank_is_missing"], 1)
+        self.assertEqual(row["fp2_long_run_pace_sample_count"], 0)
+
+    def test_era_form_resets_without_erasing_career_evidence(self):
+        row = self.row("pre_weekend")
+        self.assertEqual(row["driver_race_career_starts"], 1)
+        self.assertEqual(row["driver_race_era_starts"], 0)
+        self.assertEqual(row["driver_race_form_5_is_missing"], 1)
+        self.assertEqual(row["driver_race_era_strength_position"], features.NEUTRAL_POSITION)
+        table = features.build_features(self.results, laps=self.laps)["R"]
+        self.assertNotIn("prior_weekend_best_lap_seconds", get_feature_columns(table))
+        self.assertNotIn("prior_weekend_mean_lap_seconds", get_feature_columns(table))
+
 
 if __name__ == "__main__":
     unittest.main()

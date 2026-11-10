@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 import main as pipeline
+from tests.test_race_model import race_fixture
 
 
 class _FixedRaceModel:
@@ -59,7 +60,25 @@ class MainCliTests(unittest.TestCase):
 
 
 class MainPipelineTests(unittest.TestCase):
-    def test_collection_starts_in_2021_and_collects_all_rounds_through_target(self):
+    def test_evaluation_skips_unobserved_upcoming_target_and_forwards_settings(self):
+        frame = race_fixture(10)
+        frame.loc[frame.RoundNumber.eq(10), "target_position"] = np.nan
+        result = {"metrics": pd.DataFrame({"win_log_loss": [1.0]})}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(pipeline, "REPORTS_DIR", Path(directory)), patch(
+                "src.models.evaluate.run_race_walk_forward", return_value=result
+            ) as run:
+                pipeline._evaluate(frame, "race", 2026, 10, "post_quali", seed=7, n_simulations=123)
+        self.assertEqual(sorted(run.call_args.args[0].RoundNumber.unique()), list(range(1, 10)))
+        self.assertEqual(run.call_args.kwargs, {"seed": 7, "n_simulations": 123})
+
+    def test_evaluation_rejects_partially_observed_classification(self):
+        frame = race_fixture(10)
+        frame.loc[frame.index[-1], "target_position"] = np.nan
+        with self.assertRaisesRegex(ValueError, "Partially observed"):
+            pipeline._evaluate(frame, "race", 2026, 10, "post_quali")
+
+    def test_collection_starts_in_2021_and_selects_only_related_rounds(self):
         schedule = pd.DataFrame([dict(RoundNumber=i, EventName=f"Round {i}") for i in (1, 2, 3)])
         with tempfile.TemporaryDirectory() as directory:
             with patch("main.RAW_DATA_DIR", Path(directory)), patch(
@@ -73,7 +92,7 @@ class MainPipelineTests(unittest.TestCase):
                     pipeline.collect_historical_data(2023, "Round 2")
         self.assertEqual([(c.args[0], c.args[1]) for c in collect.call_args_list],
                          [(year, f"Round {round_number}") for year in (2021, 2022, 2023)
-                          for round_number in ((1, 2) if year == 2023 else (1, 2, 3))])
+                          for round_number in (1, 2)])
         self.assertTrue(all(c.kwargs["raise_on_failure"] for c in collect.call_args_list))
         self.assertTrue(all(c.kwargs["session_types"] == {"R"} for c in collect.call_args_list))
         stats.assert_called_once_with()

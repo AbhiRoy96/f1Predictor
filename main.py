@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.data.collect_driver_constructor_stats import collect_driver_constructor_stats
 from src.data.collect_season import _resolve_event, _session_specs, collect_event
+from src.data.event_selection import DEFAULT_EVENTS_PER_SEASON, select_related_events, similar_circuit_keys
 from src.data.normalise_entities import normalise_driver_name
 from src.data.validate_data import validate_features_df
 from src.features.engineer_features import build_features, load_results
@@ -55,22 +56,31 @@ def _missing_sessions(year, event, now=None):
     return missing
 
 
-def collect_historical_data(year: int, event: str) -> None:
-    """Incrementally collect full past calendars and this season through the target."""
+def collect_historical_data(year: int, event: str, events_per_season=DEFAULT_EVENTS_PER_SEASON,
+                            similar_circuits=None) -> None:
+    """Collect only a bounded, relevant set of weekends, reusing saved sessions."""
     if year < HISTORICAL_START_YEAR:
         raise ValueError(f"Target year must be {HISTORICAL_START_YEAR} or later.")
+    if isinstance(events_per_season, bool) or not isinstance(events_per_season, int) or events_per_season < 1:
+        raise ValueError("events_per_season must be a positive integer")
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    target_schedule = fastf1.get_event_schedule(year, include_testing=False)
+    target = _resolve_event(target_schedule, year, event)
+    if not similar_circuit_keys(target, similar_circuits):
+        logger.warning("No similar-circuit preset/override for %s; using the target and preceding events.", event)
     failures = []
     for collection_year in range(HISTORICAL_START_YEAR, year + 1):
         try:
-            schedule = fastf1.get_event_schedule(collection_year, include_testing=False)
+            schedule = (target_schedule if collection_year == year else
+                        fastf1.get_event_schedule(collection_year, include_testing=False))
             schedule = schedule.loc[pd.to_numeric(schedule["RoundNumber"], errors="coerce").gt(0)]
             schedule.assign(Year=collection_year).to_parquet(
                 RAW_DATA_DIR / f"{collection_year}_schedule.parquet", index=False)
-            limit = int(_resolve_event(schedule, year, event)["RoundNumber"]) if collection_year == year else None
-            for _, scheduled_event in schedule.sort_values("RoundNumber").iterrows():
-                if limit is not None and int(scheduled_event["RoundNumber"]) > limit:
-                    continue
+            selected = select_related_events(schedule, target, collection_year, year,
+                                             events_per_season, similar_circuits)
+            logger.info("Collection plan %s (%s/%s events): %s", collection_year, len(selected),
+                        events_per_season, ", ".join(selected.EventName.astype(str)))
+            for _, scheduled_event in selected.iterrows():
                 missing = _missing_sessions(collection_year, scheduled_event)
                 if not missing:
                     continue
@@ -88,7 +98,7 @@ def collect_historical_data(year: int, event: str) -> None:
     collect_driver_constructor_stats()
     if failures:
         raise RuntimeError("Historical collection incomplete; retry missing sessions: " + "; ".join(failures))
-    logger.info("Historical collection complete; saved rounds cover calendars through the target.")
+    logger.info("Bounded historical collection complete; other calendar events were not downloaded.")
 
 
 def _data_hash(paths, context=""):
@@ -149,7 +159,8 @@ def _add_scheduled_target(results, session, year, event):
 
 
 def ensure_processed_data(session: str, year: int, event: str, stage="post_quali",
-                          skip_collection=False) -> Path:
+                          skip_collection=False, events_per_season=DEFAULT_EVENTS_PER_SEASON,
+                          similar_circuits=None) -> Path:
     """Build or reuse a source-content-addressed staged feature table."""
     if session not in SESSION_TYPES or stage not in STAGES:
         raise ValueError("Unsupported session or prediction stage.")
@@ -157,12 +168,13 @@ def ensure_processed_data(session: str, year: int, event: str, stage="post_quali
         raise ValueError(f"Target year must be {HISTORICAL_START_YEAR} or later.")
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not skip_collection:
-        collect_historical_data(year, event)
+        collect_historical_data(year, event, events_per_season, similar_circuits)
     session_code, feature_name = SESSION_TYPES[session]
     source_paths = list(RAW_DATA_DIR.glob("*.parquet"))
     source_paths.extend(RAW_DATA_DIR.glob("*news*.csv"))
     source_paths.extend([Path("src/features/engineer_features.py"),
-                         Path("src/data/normalise_entities.py"), Path("src/utils/config.py"), Path("main.py")])
+                         Path("src/data/normalise_entities.py"), Path("src/data/outcomes.py"),
+                         Path("src/utils/config.py"), Path("main.py")])
     fingerprint = _data_hash(source_paths, f"{session}:{year}:{event}:{stage}")
     feature_path = PROCESSED_DATA_DIR / f"{feature_name}_{stage}_features.parquet"
     hash_path = feature_path.with_suffix(".sha256")
@@ -224,7 +236,13 @@ def _training_before(features, target):
     target_starts = pd.to_datetime(target["SessionStartUtc"], utc=True, errors="coerce")
     if target_starts.isna().any():
         raise ValueError("Target session has no valid SessionStartUtc cutoff.")
-    training = features.loc[starts < target_starts.min()].copy()
+    cutoff = target_starts.min()
+    if "FeatureCutoffUtc" in target:
+        cutoffs = pd.to_datetime(target.FeatureCutoffUtc, utc=True, errors="coerce")
+        if cutoffs.isna().any():
+            raise ValueError("Target session has no valid FeatureCutoffUtc.")
+        cutoff = min(cutoff, cutoffs.min())
+    training = features.loc[starts < cutoff].copy()
     training = training.loc[pd.to_numeric(training["target_position"], errors="coerce").gt(0)]
     if training.empty or training["target_winner"].dropna().nunique() < 2:
         raise ValueError("Not enough historical winner examples before the target session.")
@@ -255,7 +273,7 @@ def _measure_prediction_variation(predictions, actuals):
         "podium_probability_brier": float((measured.podium_probability_error ** 2).mean()),
         "position_mae": float(measured.absolute_position_error.mean()),
         "position_median_absolute_error": float(measured.absolute_position_error.median()),
-        "position_bias": float(measured.position_error.mean()),
+        "position_error_std": float(measured.position_error.std(ddof=0)),
     }
     return measured, summary
 
@@ -264,7 +282,7 @@ def _training_hash(training):
     values = training.sort_index(axis=1).astype(str)
     data = pd.util.hash_pandas_object(values, index=False).to_numpy().tobytes()
     paths = [*Path("src/models").glob("*.py"), *Path("src/simulation").glob("*.py"),
-             Path("src/utils/config.py")]
+             Path("src/utils/config.py"), Path("src/data/outcomes.py")]
     return _data_hash(paths, hashlib.sha256(data).hexdigest())
 
 
@@ -357,16 +375,30 @@ def _validate_prediction_probabilities(predictions):
         raise ValueError("Predictions must satisfy win <= podium <= top10.")
 
 
-def _evaluate(features, session, year, target_round, stage, seed=42):
+def _evaluate(features, session, year, target_round, stage, seed=42, n_simulations=20000):
     from src.models.evaluate import run_race_walk_forward
 
-    result = run_race_walk_forward(features, seed=seed)
+    keys = ["Year", "RoundNumber"]
+    observed = pd.to_numeric(features.target_position, errors="coerce").notna()
+    groups = observed.groupby([features[column] for column in keys])
+    complete = groups.transform("all")
+    if (groups.transform("any") & ~complete).any():
+        raise ValueError("Partially observed event classification; cannot evaluate an incomplete field.")
+    if (~complete).any():
+        logger.info("Excluding %s events with unobserved classifications from evaluation.",
+                    len(features.loc[~complete, keys].drop_duplicates()))
+        features = features.loc[complete].copy()
+    if len(features[keys].drop_duplicates()) < 9:
+        raise ValueError("Walk-forward evaluation needs at least nine completed events (eight training, one held out).")
+    result = run_race_walk_forward(features, seed=seed, n_simulations=n_simulations)
+    if result["metrics"].empty:
+        raise ValueError("Walk-forward evaluation needs at least nine completed events (eight training, one held out).")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     prefix = f"walk_forward_{session}_{year}_rnd{target_round}_{stage}"
     for name, value in result.items():
         if isinstance(value, pd.DataFrame):
             value.to_parquet(REPORTS_DIR / f"{prefix}_{name}.parquet", index=False)
-    for name in ("metrics", "baselines", "reliability"):
+    for name in ("summary", "confidence", "reliability"):
         if name in result:
             print(f"\n{name.upper()}\n{result[name].to_string(index=False)}")
     return result
@@ -374,10 +406,12 @@ def _evaluate(features, session, year, target_round, stage, seed=42):
 
 def run_pipeline(session, year, event, measure_variation=False, *, stage="post_quali",
                  skip_collection=False, action="auto", model_path=None, n_simulations=20000,
-                 seed=42, scenario="standard_dry"):
+                 seed=42, scenario="standard_dry", events_per_season=DEFAULT_EVENTS_PER_SEASON,
+                 similar_circuits=None):
     if n_simulations <= 0:
         raise ValueError("n_simulations must be positive.")
-    feature_path = ensure_processed_data(session, year, event, stage, skip_collection)
+    feature_path = ensure_processed_data(session, year, event, stage, skip_collection,
+                                        events_per_season, similar_circuits)
     features = pd.read_parquet(feature_path)
     valid, errors = validate_features_df(features)
     if not valid:
@@ -387,7 +421,7 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
     if action == "evaluate":
         cutoff = pd.to_datetime(target.SessionStartUtc, utc=True).min()
         return _evaluate(features.loc[pd.to_datetime(features.SessionStartUtc, utc=True) <= cutoff],
-                         session, year, target_round, stage, seed)
+                         session, year, target_round, stage, seed, n_simulations)
     if measure_variation:
         training, target = _prepare_backtest_data(features, year, target_round, event_name, session)
         PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -415,7 +449,9 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
                     "training_start_utc": str(training.SessionStartUtc.min()),
                     "training_end_utc": str(training.SessionStartUtc.max()),
                     "training_races": len(training[["Year", "RoundNumber"]].drop_duplicates()),
-                    "scenario": scenario, "simulation_count": n_simulations, "seed": seed}
+                    "scenario": scenario, "simulation_count": n_simulations, "seed": seed,
+                    "events_per_season_cap": events_per_season,
+                    "history_scope": "available_collected_sessions_not_full_championship"}
     summary = None
     if measure_variation:
         predictions, summary = _measure_prediction_variation(predictions, target)
@@ -451,16 +487,23 @@ def main(argv=None):
     parser.add_argument("--n-simulations", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--scenario", default="standard_dry")
+    parser.add_argument("--events-per-season", type=int, default=DEFAULT_EVENTS_PER_SEASON,
+                        help="Maximum collected weekends per season, including the target (default: 6)")
+    parser.add_argument("--similar-circuits", nargs="*", default=None,
+                        help="Override heuristic circuit presets; pass with no names to disable them")
     args = parser.parse_args(arguments)
     if args.year < HISTORICAL_START_YEAR:
         parser.error(f"year must be {HISTORICAL_START_YEAR} or later")
     if args.n_simulations <= 0:
         parser.error("--n-simulations must be positive")
+    if args.events_per_season <= 0:
+        parser.error("--events-per-season must be positive")
     if args.measure_variation and action in {"train", "evaluate"}:
         parser.error("--measure-variation is only valid for prediction")
     options = dict(stage=args.stage, skip_collection=args.skip_collection, action=action,
                    model_path=args.model_path, n_simulations=args.n_simulations, seed=args.seed,
-                   scenario=args.scenario)
+                   scenario=args.scenario, events_per_season=args.events_per_season,
+                   similar_circuits=args.similar_circuits)
     return run_pipeline(args.session, args.year, args.event, measure_variation=args.measure_variation, **options)
 
 

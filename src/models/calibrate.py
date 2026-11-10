@@ -9,6 +9,50 @@ from scipy.special import logsumexp
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 
 
+def fit_simulation_temperature(examples, default=1.0, n_simulations=1024, seed=42):
+    """Fit one scale against final OOF win and podium probabilities.
+
+    Each example supplies past-only strength/risk predictions and a complete
+    held-out race. Common random numbers make candidate comparisons repeatable.
+    """
+    from src.simulation.race_simulator import MonteCarloRaceSimulator, session_scenario
+
+    if not examples:
+        return float(default)
+    cache = {}
+
+    def loss(temperature):
+        key = float(temperature)
+        if key not in cache:
+            values = []
+            for i, example in enumerate(examples):
+                frame = example["frame"].reset_index(drop=True)
+                grid = frame.copy()
+                grid["Abbreviation"] = np.arange(len(frame))
+                prediction = MonteCarloRaceSimulator(n_simulations, seed + i).simulate(
+                    grid, session_scenario(frame), strength=example["strength"],
+                    p_dnf=example["p_dnf"], pl_temperature=key,
+                    race_correlation=example.get("race_correlation", 0.0))
+                prediction = prediction.set_index("Abbreviation").reindex(np.arange(len(frame)))
+                position = frame.target_position.to_numpy(float)
+                winner = int(position.argmin())
+                p = np.clip(prediction.podium_probability.to_numpy(), 1e-12, 1 - 1e-12)
+                podium = position <= min(3, len(frame))
+                values.append(-np.log(np.clip(prediction.win_probability.iloc[winner], 1e-12, 1))
+                              - np.mean(podium * np.log(p) + (~podium) * np.log1p(-p)))
+            cache[key] = float(np.mean(values))
+        return cache[key]
+
+    candidates = np.unique(np.r_[np.geomspace(.3, 5, 7), default])
+    best = int(np.argmin([loss(t) for t in candidates]))
+    lower, upper = candidates[max(0, best - 1)], candidates[min(len(candidates) - 1, best + 1)]
+    if lower < upper:
+        refined = minimize_scalar(loss, bounds=(lower, upper), method="bounded",
+                                  options={"xatol": .04, "maxiter": 10})
+        loss(refined.x)
+    return min(cache, key=cache.get)
+
+
 def fit_temperature(scores_by_race, winner_idx_by_race, default=1.0):
     """Fit only caller-supplied held-out scores; one winner per race."""
     if not scores_by_race:

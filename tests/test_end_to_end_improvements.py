@@ -44,12 +44,15 @@ class EndToEndImprovementsTests(unittest.TestCase):
                 pipeline, "_resolve_target_event", return_value=(10, "Round 10")
             ), patch.object(pipeline, "MODELS_DIR", models), patch("main.PROCESSED_DATA_DIR", root), patch(
                 "main.PREDICTIONS_DATA_DIR", root / "predictions"
+            ), patch("main.REPORTS_DIR", root / "reports"
             ), redirect_stdout(io.StringIO()) as output:
                 artifact = pipeline.run_pipeline("race", 2024, "Round 10", action="train")
                 production = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in models.rglob("*") if p.is_file()}
                 predicted = pipeline.run_pipeline("race", 2024, "Round 10", action="predict", n_simulations=1000)
                 repeated = pipeline.run_pipeline("race", 2024, "Round 10", action="predict", n_simulations=1000)
                 held_out = pipeline.run_pipeline("race", 2024, "Round 10", measure_variation=True, n_simulations=1000)
+                evaluated = pipeline.run_pipeline("race", 2024, "Round 10", action="evaluate",
+                                                  n_simulations=200, seed=17)
             self.assertTrue(artifact["metadata"]["model_version"])
             self.assertEqual(len(list(models.glob("*/metadata.json"))), 1)
             self.assertEqual(production, {p: (p.stat().st_mtime_ns, p.read_bytes())
@@ -66,6 +69,9 @@ class EndToEndImprovementsTests(unittest.TestCase):
             saved = pd.read_parquet(root / "predictions/predictions_race_2024_rnd10_post_quali.parquet")
             self.assertIn("position_error", saved)
             self.assertTrue(saved.variation_measured.all())
+            self.assertEqual(len(evaluated["metrics"]), 8)
+            self.assertEqual(evaluated["predictions"].simulation_count.unique().tolist(), [200])
+            self.assertTrue((root / "reports/walk_forward_race_2024_rnd10_post_quali_confidence.parquet").exists())
 
 
 if __name__ == "__main__":

@@ -2,13 +2,14 @@
 
 import numpy as np
 import pandas as pd
+from scipy.special import ndtr
 
 from src.simulation.scenarios import RaceScenario, get_scenario
 from src.utils.config import RANDOM_SEED
 
 
 def simulate_race(strength, p_dnf, n_sims=20000, pl_temperature=1.0,
-                  team_idx=None, team_sigma=0.0, seed=42):
+                  team_idx=None, team_sigma=0.0, seed=42, race_correlation=0.0):
     """Return (places, retired), both shaped (simulations, drivers)."""
     strength = np.asarray(strength, dtype=float)
     p_dnf = np.asarray(p_dnf, dtype=float)
@@ -22,6 +23,8 @@ def simulate_race(strength, p_dnf, n_sims=20000, pl_temperature=1.0,
         raise ValueError("n_sims must be a positive integer")
     if not np.isfinite(pl_temperature) or pl_temperature <= 0 or not np.isfinite(team_sigma) or team_sigma < 0:
         raise ValueError("Temperature must be positive and team_sigma nonnegative")
+    if not np.isfinite(race_correlation) or not 0 <= race_correlation < 1:
+        raise ValueError("race_correlation must lie in [0, 1)")
     rng = np.random.default_rng(seed)
     n = len(strength)
     util = strength / pl_temperature + rng.gumbel(size=(n_sims, n))
@@ -31,31 +34,102 @@ def simulate_race(strength, p_dnf, n_sims=20000, pl_temperature=1.0,
             raise ValueError("team_idx must contain one nonnegative team index per driver")
         _, team_idx = np.unique(team_idx, return_inverse=True)
         util += rng.normal(0, team_sigma, size=(n_sims, team_idx.max() + 1))[:, team_idx]
-    retired = rng.random((n_sims, n)) < p_dnf
-    # Lexicographic sorting keeps even extreme strengths behind all finishers.
-    retirement_order = rng.random((n_sims, n))
-    order = np.lexsort((np.where(retired, retirement_order, -util), retired), axis=1)
+    if race_correlation > 0:
+        common = rng.normal(size=(n_sims, 1))
+        individual = rng.normal(size=(n_sims, n))
+        failure_draw = ndtr(np.sqrt(race_correlation) * common + np.sqrt(1 - race_correlation) * individual)
+        failure_draw = np.minimum(failure_draw, 1 - np.finfo(float).eps)
+    else:
+        failure_draw = rng.random((n_sims, n))
+    retired = failure_draw < p_dnf
+    hazard = -np.log1p(-np.minimum(p_dnf, 1 - 1e-12))
+    distance = np.divide(-np.log1p(-failure_draw), hazard,
+                         out=np.full_like(failure_draw, np.inf), where=hazard > 0)
+    # Constant-hazard distance proxy: later retirements precede earlier ones.
+    # Finishers remain ahead; this is not a lap-by-lap FIA classification model.
+    order = np.lexsort((np.where(retired, -distance, -util), retired), axis=1)
     pos = np.empty_like(order)
     np.put_along_axis(pos, order, np.broadcast_to(np.arange(1, n + 1), order.shape), axis=1)
     return pos, retired
 
 
-def summarize_positions(positions, retired):
-    """Coherent unconditional probabilities; no rounding or dropped retirements."""
+def summarize_positions(positions, retired, prior_mass=0.5):
+    """Regularize orders conditional on sampled finisher/retiree groups.
+
+    Half a simulated race of uniform within-group ordering reduces rare-order
+    zeros without assigning a guaranteed retiree a win over guaranteed finishers.
+    Mixing permutation distributions preserves every row/column sum exactly.
+    MC standard errors describe numerical sampling, not model uncertainty.
+    """
     n = positions.shape[1]
+    count = len(positions)
+    matrix = np.column_stack([(positions == place).sum(axis=0) for place in range(1, n + 1)])
+    prior = np.zeros((n, n))
+    finisher_count = (~retired).sum(axis=1)
+    for finishers in np.unique(finisher_count):
+        mask = finisher_count == finishers
+        if finishers:
+            prior[:, :finishers] += (~retired[mask]).sum(axis=0)[:, None] / (count * finishers)
+        if finishers < n:
+            prior[:, finishers:] += retired[mask].sum(axis=0)[:, None] / (count * (n - finishers))
+    matrix = (matrix + prior_mass * prior) / (count + prior_mass)
+    cumulative = matrix.cumsum(axis=1)
+    p_win = matrix[:, 0]
     result = pd.DataFrame({
-        "win_probability": (positions == 1).mean(axis=0),
-        "podium_probability": (positions <= min(3, n)).mean(axis=0),
-        "top10_probability": (positions <= min(10, n)).mean(axis=0),
+        "win_probability": p_win,
+        "podium_probability": matrix[:, :3].sum(axis=1) if n > 3 else np.ones(n),
+        "top10_probability": matrix[:, :10].sum(axis=1) if n > 10 else np.ones(n),
         "dnf_probability": retired.mean(axis=0),
-        "expected_position": positions.mean(axis=0),
-        "median_position": np.median(positions, axis=0),
-        "p10_position": np.percentile(positions, 10, axis=0),
-        "p90_position": np.percentile(positions, 90, axis=0),
+        "expected_position": matrix @ np.arange(1, n + 1),
+        "median_position": (cumulative < .5).sum(axis=1) + 1,
+        "p10_position": (cumulative < .1).sum(axis=1) + 1,
+        "p90_position": (cumulative < .9).sum(axis=1) + 1,
+        "win_probability_mcse": np.sqrt(p_win * (1 - p_win) / count),
+        "probability_smoothing_mass": prior_mass,
     })
     for position in range(1, n + 1):
-        result[f"prob_p{position}"] = (positions == position).mean(axis=0)
+        result[f"prob_p{position}"] = matrix[:, position - 1]
     return result
+
+
+def session_scenario(drivers, scenario="standard_dry"):
+    """Qualifying orders have no race-distance retirement or safety-car process."""
+    if "SessionType" in drivers and drivers.SessionType.isin(["Q", "SQ"]).all():
+        if scenario != "standard_dry":
+            raise ValueError("Race scenarios are not supported for qualifying predictions")
+        return RaceScenario("Qualifying order", "Conditional qualifying order, not a race simulation.",
+                            safety_car_probability=0, vsc_probability=0,
+                            weather_rain_probability=0, dnf_base_rate=0)
+    return scenario
+
+
+def simulate_saved_prediction(predictions, scenario="standard_dry", n_simulations=None, seed=None):
+    """Reuse latent inputs, never reinterpret final win probabilities as strengths."""
+    required = {"strength", "base_dnf_probability", "pl_temperature", "Abbreviation", "race_retirement_correlation"}
+    missing = required.difference(predictions.columns)
+    if missing or predictions.empty:
+        raise ValueError(f"Regenerate predictions with saved simulation inputs; missing {sorted(missing)}")
+    if predictions.Abbreviation.duplicated().any():
+        raise ValueError("Saved prediction must contain one row per driver")
+    if {"Year", "RoundNumber"}.issubset(predictions) and len(predictions[["Year", "RoundNumber"]].drop_duplicates()) != 1:
+        raise ValueError("Scenario replay requires exactly one event")
+    frame = predictions.sort_values("Abbreviation", kind="stable").reset_index(drop=True)
+    for column in ("pl_temperature", "race_retirement_correlation", "simulation_count", "seed"):
+        if column in frame and frame[column].nunique(dropna=False) != 1:
+            raise ValueError(f"Saved prediction contains inconsistent {column}")
+    if n_simulations is None:
+        if "simulation_count" not in frame:
+            raise ValueError("Saved prediction has no simulation_count")
+        n_simulations = int(frame.simulation_count.iloc[0])
+    if seed is None:
+        if "seed" not in frame:
+            raise ValueError("Saved prediction has no seed")
+        seed = int(frame.seed.iloc[0])
+    return MonteCarloRaceSimulator(n_simulations, seed).simulate(
+        frame, session_scenario(frame, scenario), strength=frame.strength.to_numpy(float),
+        p_dnf=frame.base_dnf_probability.to_numpy(float),
+        pl_temperature=float(frame.pl_temperature.iloc[0]),
+        race_correlation=float(frame.race_retirement_correlation.iloc[0]))
 
 
 class MonteCarloRaceSimulator:
@@ -68,7 +142,7 @@ class MonteCarloRaceSimulator:
         self.random_seed = random_seed
 
     def simulate(self, drivers_df, scenario="standard_dry", win_probabilities=None,
-                 strength=None, p_dnf=None, pl_temperature=1.0):
+                 strength=None, p_dnf=None, pl_temperature=1.0, race_correlation=0.0):
         sc = get_scenario(scenario) if isinstance(scenario, str) else scenario
         if not isinstance(sc, RaceScenario):
             raise TypeError("scenario must be a name or RaceScenario")
@@ -119,11 +193,19 @@ class MonteCarloRaceSimulator:
             positions[mask], retired[mask] = simulate_race(
                 strength, np.clip(risks * (1 + 0.4 * bool(code & 4)), 0, 1),
                 int(mask.sum()), temperature * scale, team_idx,
-                sc.team_sigma * sc.tyre_deg_multiplier, int(rng.integers(0, 2**32)))
+                sc.team_sigma * sc.tyre_deg_multiplier, int(rng.integers(0, 2**32)),
+                race_correlation=race_correlation)
         result = summarize_positions(positions, retired)
         result["Abbreviation"] = drivers.get("Abbreviation", drivers.get("Driver", pd.Series(np.arange(n))))
         result["TeamName"] = drivers.get("TeamName", "Unknown")
         result["scenario"] = scenario if isinstance(scenario, str) else sc.name
+        result["scenario_kind"] = ("calibrated_reference" if scenario == "standard_dry"
+                                   else "heuristic_sensitivity")
+        result["uncertainty_kind"] = "conditional_outcomes_not_parameter_confidence"
+        result["simulation_count"] = self.n_simulations
+        result["seed"] = self.random_seed
+        result["pl_temperature"] = pl_temperature
+        result["race_retirement_correlation"] = race_correlation
         for target, source in [("simulated_win_prob", "win_probability"),
                                ("simulated_podium_prob", "podium_probability"),
                                ("simulated_dnf_prob", "dnf_probability")]:

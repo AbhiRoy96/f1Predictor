@@ -76,12 +76,16 @@ class TestEvaluationImprovements(unittest.TestCase):
     def test_complete_metrics_reliability_and_bias(self):
         result = self.result
         expected = {"win_log_loss", "win_brier", "top_1_accuracy", "top_3_coverage", "podium_brier",
-                    "podium_log_loss", "top_3_overlap", "spearman", "kendall_tau", "pl_log_likelihood",
-                    "position_mae", "position_median_absolute_error", "position_signed_error", "dnf_brier"}
+                    "podium_log_loss", "top_3_overlap", "spearman", "kendall_tau", "finisher_pl_nll_diagnostic",
+                    "position_mae", "position_median_absolute_error", "position_error_std", "dnf_brier",
+                    "position_log_loss", "position_rps", "position_interval_80_coverage"}
         self.assertTrue(expected.issubset(result["metrics"].columns))
         self.assertEqual(len(result["metrics"]), 16)
         self.assertEqual(set(result["summary"].model), {"race_model", "grid", "championship", "team"})
         self.assertTrue(np.isfinite(result["metrics"][list(expected)]).all().all())
+        self.assertNotIn("pl_log_likelihood", result["metrics"])
+        self.assertNotIn("position_signed_error", result["metrics"])
+        self.assertTrue(result["confidence"].ci_low.isna().all())
         for target in ["win", "podium", "top10", "dnf"]:
             table = result[f"reliability_{target}"]
             self.assertEqual(set(table.model), {"race_model", "grid", "championship", "team"})

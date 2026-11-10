@@ -7,6 +7,7 @@ from src.data.normalise_entities import (
     build_driver_lookup, constructor_lineage, normalise_circuit,
     normalise_constructor, normalise_driver_name,
 )
+from src.data.outcomes import dnf_labels
 from src.utils.config import get_feature_columns
 
 RAW = Path("data/raw")
@@ -144,8 +145,8 @@ def _normalize_results(frame):
     frame["_winner"] = (frame["_race_outcome"] & frame["Position"].eq(1)).astype(int)
     frame["_podium"] = (frame["_race_outcome"] & frame["Position"].between(1, 3)).astype(int)
     frame["_category"] = np.select(
-        [frame["SessionType"].isin(RACE_TYPES), frame["SessionType"].isin(QUALIFYING_TYPES)],
-        ["race", "qualifying"],
+        [frame["SessionType"].eq(code) for code in ("R", "S", "Q", "SQ")],
+        ["race", "sprint", "qualifying", "sprint_qualifying"],
         default="other",
     )
     keys = ["Year", "RoundNumber", "SessionType", "Abbreviation"]
@@ -155,17 +156,8 @@ def _normalize_results(frame):
 
 
 def _dnf_labels(frame):
-    status = frame.get("Status", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
-    classification = frame.get("ClassifiedPosition", pd.Series("", index=frame.index)).fillna("").astype(str)
-    finished = status.str.match(r"(?i)^(finished|\+\d+ laps?)$")
-    collision = status.str.contains(r"(?i)collision|accident|spun off", regex=True)
-    mechanical = status.str.contains(
-        r"(?i)engine|gearbox|transmission|hydraul|electri|brake|suspension|power|oil|water|fuel|clutch|driveshaft|radiator|overheat|technical|mechanical|turbo|exhaust|battery|differential|steering|puncture|tyre", regex=True)
-    retired = collision | mechanical | classification.str.upper().isin(["R", "RETIRED"])
-    retired |= status.str.contains(r"(?i)^retired$", regex=True)
-    known = finished | retired
     race = frame["SessionType"].isin(RACE_TYPES)
-    return tuple(values.astype(float).where(known & race) for values in (retired, mechanical, collision))
+    return tuple(values.where(race) for values in dnf_labels(frame))
 
 
 def _prepare_auxiliary(frame, results):
@@ -235,6 +227,34 @@ def _seconds(values):
     if pd.api.types.is_numeric_dtype(values):
         return pd.to_numeric(values, errors="coerce")
     return pd.to_timedelta(values, errors="coerce").dt.total_seconds()
+
+
+def _clean_pace_laps(laps):
+    """Keep comparable clean laps and identify within-session track-time cohorts."""
+    frame = laps.copy()
+    if "LapTime" not in frame:
+        return frame.iloc[:0]
+    frame["seconds"] = _seconds(frame["LapTime"])
+    frame = frame.loc[frame.seconds.gt(0)]
+    if "IsAccurate" in frame:
+        frame = frame.loc[frame.IsAccurate.fillna(False).astype(bool)]
+    if "Deleted" in frame:
+        frame = frame.loc[~frame.Deleted.fillna(False).astype(bool)]
+    if "TrackStatus" in frame:
+        frame = frame.loc[frame.TrackStatus.astype(str).isin(["1", "1.0"])]
+    for column in ("PitInTime", "PitOutTime"):
+        if column in frame:
+            frame = frame.loc[frame[column].isna()]
+    if "LapStartDate" in frame:
+        observed = pd.to_datetime(frame.LapStartDate, utc=True, errors="coerce")
+        elapsed = (observed - frame.SessionStartUtc).dt.total_seconds()
+    elif "Time" in frame:
+        elapsed = _seconds(frame.Time)
+    else:
+        elapsed = pd.Series(np.nan, index=frame.index)
+    frame["_pace_time_known"] = elapsed.notna()
+    frame["_pace_time_bin"] = (elapsed / 600).floordiv(1).fillna(-1)
+    return frame
 
 
 def _weekend_features(target, abbreviation, laps, weather, messages, results):
@@ -350,7 +370,7 @@ class _HistoryIndex:
     """Prefix aggregates built once; each query uses three binary searches."""
 
     def __init__(self, results, team=False):
-        eligible = results.loc[results["_category"].isin(["race", "qualifying"])
+        eligible = results.loc[results["_category"].isin(["race", "sprint", "qualifying", "sprint_qualifying"])
                                & results["Position"].notna()
                                & results["SessionStartUtc"].notna()].copy()
         self.team = team
@@ -363,8 +383,9 @@ class _HistoryIndex:
                   _winner=("_winner", "sum"), _podium=("_podium", "sum"),
                   _dnf=("_dnf", "mean"), _mechanical=("_mechanical", "mean"),
                   _collision=("_collision", "mean"))
+        eligible["_era"] = np.select([eligible.Year.ge(2026), eligible.Year.ge(2022)], [2026, 2022], default=2014)
         self.groups = {}
-        for dimension in (None, "Year", "CircuitName"):
+        for dimension in (None, "Year", "CircuitName", "_era"):
             keys = [self.entity, "_category"] + ([dimension] if dimension else [])
             for key, group in eligible.groupby(keys, dropna=False):
                 group = group.sort_values("SessionStartUtc")
@@ -403,11 +424,16 @@ class _HistoryIndex:
         entity = target[self.entity]
         cutoff = target["FeatureCutoffUtc"]
         prefix = ("constructor" if self.team else "driver") + "_" + category + "_"
+        if target["SessionType"] in {"S", "SQ"}:
+            category = {"race": "sprint", "qualifying": "sprint_qualifying"}.get(category, category)
+        era = 2026 if target["Year"] >= 2026 else (2022 if target["Year"] >= 2022 else 2014)
         features = {}
         career, source = self._lookup(entity, category, cutoff)
+        era_stats, _ = self._lookup(entity, category, cutoff, "_era", era)
         current = {}
         for name, dimension, value in (("career", None, None), ("season", "Year", target["Year"]),
-                                       ("circuit", "CircuitName", target["CircuitName"])):
+                                       ("circuit", "CircuitName", target["CircuitName"]),
+                                       ("era", "_era", era)):
             stats, _ = self._lookup(entity, category, cutoff, dimension, value)
             if name == "season":
                 current = stats
@@ -415,8 +441,10 @@ class _HistoryIndex:
             for metric, column in (("wins", "_winner"), ("podiums", "_podium"), ("points", "Points")):
                 features[prefix + name + "_" + metric] = stats.get(column, 0)
             features[prefix + name + "_avg_position"] = stats.get("position", np.nan)
+            features[prefix + name + "_points_per_start"] = (
+                stats.get("Points", 0) / stats["count"] if stats.get("count", 0) else np.nan)
         for metric in ("form_3", "form_5", "points_5", "ewma_position", "ewma_points"):
-            features[prefix + metric] = career.get(metric, np.nan if metric != "points_5" else 0)
+            features[prefix + metric] = era_stats.get(metric, np.nan if metric != "points_5" else 0)
         if not self.team:
             features[prefix + "ewma_finish_vs_grid"] = career.get("finish_vs_grid", np.nan)
             features[prefix + "position_change"] = career.get("position_change", np.nan)
@@ -426,11 +454,15 @@ class _HistoryIndex:
         previous, _ = self._lookup(entity, category, min(cutoff, year_start))
         prior = previous.get("position", NEUTRAL_POSITION)
         features[prefix + "strength_position"] = weight * current.get("position", prior) + (1 - weight) * prior
+        era_previous, _ = self._lookup(entity, category, min(cutoff, year_start), "_era", era)
+        era_prior = era_previous.get("position", NEUTRAL_POSITION)
+        features[prefix + "era_strength_position"] = (
+            weight * current.get("position", era_prior) + (1 - weight) * era_prior)
         features[prefix + "strength_current_weight"] = weight
         for metric, column, prior_rate in (("dnf", "_dnf", .05), ("mechanical", "_mechanical", .03),
                                            ("collision", "_collision", .02)):
             features[prefix + metric + "_rate_shrunk"] = (
-                career.get(column, 0) + 20 * prior_rate) / (career.get(column + "_n", 0) + 20)
+                era_stats.get(column, 0) + 20 * prior_rate) / (era_stats.get(column + "_n", 0) + 20)
         return features, source
 
 
@@ -479,6 +511,9 @@ def _stage_features(target, event, laps, weather, messages):
                    "quali_gap_to_teammate_pct", "grid_penalty_places", "pit_lane_start",
                    "fp2_long_run_pace_rank", "fp_best_lap_gap_pct", "fp_teammate_gap_pct"):
         features[column] = np.nan
+    for column in ("quali_reference_phase", "fp2_long_run_pace_sample_count",
+                   "fp2_long_run_pace_mad", "fp2_track_time_coverage"):
+        features[column] = np.nan
     qualifying_type = "SQ" if target["SessionType"] == "S" else "Q"
     qualifying = prior.loc[prior["SessionType"].eq(qualifying_type)]
     driver = qualifying.loc[qualifying["Abbreviation"].eq(target["Abbreviation"])]
@@ -489,7 +524,13 @@ def _stage_features(target, event, laps, weather, messages):
             for column in ("Q1", "Q2", "Q3", "BestLapTime"):
                 if column in qualifying:
                     best[column] = _seconds(qualifying[column])
-            times = best.min(axis=1).where(lambda values: values.gt(0))
+            own_rows = best.reindex(driver.index)
+            phases = [c for c in ("Q3", "Q2", "Q1", "BestLapTime")
+                      if c in own_rows and own_rows[c].gt(0).any()]
+            phase = phases[0] if phases else None
+            times = (best[phase].where(lambda values: values.gt(0)) if phase else
+                     pd.Series(np.nan, index=qualifying.index))
+            features["quali_reference_phase"] = {"Q1": 1, "Q2": 2, "Q3": 3}.get(phase, 0)
             own_time = times.loc[driver.index].min()
             mates = qualifying.loc[qualifying["team_lineage"].eq(target["team_lineage"])
                                     & qualifying["Abbreviation"].ne(target["Abbreviation"])]
@@ -515,15 +556,17 @@ def _stage_features(target, event, laps, weather, messages):
 
     practice = selected[0]
     if not practice.empty and "LapTime" in practice and "Abbreviation" in practice:
-        practice = practice.loc[practice["SessionType"].isin(["FP1", "FP2", "FP3"])].copy()
-        practice["seconds"] = _seconds(practice["LapTime"])
-        practice = practice.loc[practice["seconds"].gt(0)]
-        if "IsAccurate" in practice:
-            practice = practice.loc[practice["IsAccurate"].fillna(False).astype(bool)]
-        for column in ("PitInTime", "PitOutTime"):
-            if column in practice:
-                practice = practice.loc[practice[column].isna()]
-        best = practice.groupby("Abbreviation")["seconds"].min()
+        practice = _clean_pace_laps(practice.loc[practice["SessionType"].isin(["FP1", "FP2", "FP3"])])
+        own_laps = practice.loc[practice.Abbreviation.eq(target["Abbreviation"])]
+        comparison = practice.iloc[:0]
+        if not own_laps.empty:
+            own_session = own_laps.SessionStartUtc.max()
+            comparison = practice.loc[practice.SessionStartUtc.eq(own_session)]
+            own_latest = own_laps.loc[own_laps.SessionStartUtc.eq(own_session)]
+            if "Compound" in comparison:
+                compound = own_latest.loc[own_latest.seconds.idxmin(), "Compound"]
+                comparison = comparison.loc[comparison.Compound.eq(compound)]
+        best = comparison.groupby("Abbreviation")["seconds"].min()
         own = best.get(target["Abbreviation"], np.nan)
         if pd.notna(own) and not best.empty:
             features["fp_best_lap_gap_pct"] = (own / best.min() - 1) * 100
@@ -534,16 +577,19 @@ def _stage_features(target, event, laps, weather, messages):
                 features["fp_teammate_gap_pct"] = (own / mate - 1) * 100
         long_runs = practice.loc[practice["SessionType"].eq("FP2")].copy()
         if not long_runs.empty and "Stint" in long_runs:
-            # Within-compound/tyre-age residuals avoid rewarding fresh soft tyres.
-            correction = [column for column in ("Compound", "TyreLife") if column in long_runs]
-            if correction:
-                long_runs["pace"] = long_runs["seconds"] - long_runs.groupby(
-                    correction, dropna=False)["seconds"].transform("median")
-            else:
-                long_runs["pace"] = long_runs["seconds"]
+            correction = ["SessionStartUtc", "_pace_time_bin"] + [
+                column for column in ("Compound", "TyreLife") if column in long_runs]
+            cohorts = long_runs.groupby(correction, dropna=False)
+            comparable = cohorts.Abbreviation.transform("nunique").ge(2)
+            long_runs["pace"] = (long_runs.seconds - cohorts.seconds.transform("median")).where(comparable)
             stints = long_runs.groupby(["Abbreviation", "Stint"])["pace"].agg(["median", "count"])
             pace = stints.loc[stints["count"].ge(5), "median"].groupby("Abbreviation").median()
             features["fp2_long_run_pace_rank"] = pace.rank(method="min").get(target["Abbreviation"], np.nan)
+            own_runs = long_runs.loc[long_runs.Abbreviation.eq(target["Abbreviation"]) & long_runs.pace.notna()]
+            features["fp2_long_run_pace_sample_count"] = len(own_runs)
+            if not own_runs.empty:
+                features["fp2_long_run_pace_mad"] = (own_runs.pace - own_runs.pace.median()).abs().median()
+                features["fp2_track_time_coverage"] = own_runs["_pace_time_known"].mean()
     return features
 
 

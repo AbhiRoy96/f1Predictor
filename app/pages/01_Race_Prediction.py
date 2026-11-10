@@ -8,7 +8,7 @@ import plotly.express as px
 import streamlit as st
 
 from src.data.normalise_entities import normalise_driver_name
-from src.simulation.race_simulator import MonteCarloRaceSimulator
+from src.simulation.race_simulator import simulate_saved_prediction
 from src.simulation.scenarios import SCENARIOS
 from src.utils.config import PREDICTIONS_DATA_DIR
 from src.visualization.telemetry import create_win_probability_chart, create_podium_probability_chart
@@ -115,7 +115,8 @@ def evaluation_report_paths(metadata: pd.Series) -> dict[str, Path]:
         f"rnd{int(metadata['round_number'])}_{metadata['stage']}"
     )
     reports = Path("reports")
-    return {name: reports / f"{prefix}_{name}.parquet" for name in ("summary", "reliability", "driver_bias", "team_bias")}
+    return {name: reports / f"{prefix}_{name}.parquet"
+            for name in ("summary", "confidence", "reliability", "driver_bias", "team_bias")}
 
 
 def main():
@@ -146,7 +147,7 @@ def main():
     if generated_at is not None and pd.notna(generated_at):
         st.caption(f"Prediction generated at {generated_at} (UTC)")
     st.markdown(
-        "**Model Architecture:** point-in-time strength ranker + reliability model + calibrated Plackett–Luce simulation")
+        "**Model Architecture:** conditional-finisher strength ranker + retirement model + final-distribution calibration")
     provenance = {
         "Stage": metadata.get("stage", "unknown"),
         "Model": metadata.get("model_version", "demo"),
@@ -157,6 +158,13 @@ def main():
         "Samples": metadata.get("simulation_count", "unknown"),
     }
     st.caption(" | ".join(f"{key}: {value}" for key, value in provenance.items()))
+    st.caption(
+        "P10-P90 ranges describe simulated finishing outcomes, not parameter confidence intervals. "
+        "MC standard errors measure numerical sampling error only.")
+    if metadata.get("training_races", metadata.get("n_train_races", 0)) < 30:
+        st.warning("Limited historical evidence: probabilities and calibration need more held-out races before they can be trusted.")
+    if metadata.get("history_scope") == "available_collected_sessions_not_full_championship":
+        st.caption("History covers collected events only. Season points/form are sampled-history summaries, not complete championship standings.")
     st.markdown("---")
 
     df = df.sort_values("win_probability", ascending=False).reset_index(drop=True)
@@ -177,6 +185,7 @@ def main():
         "DriverName", "Abbreviation", "TeamName", "win_probability", "podium_probability",
         "top10_probability", "expected_position", "median_position", "p10_position",
         "p90_position", "dnf_probability", "vs_grid_order",
+        "win_probability_mcse",
     ]
     st.markdown("### Race prediction and uncertainty")
     st.dataframe(df[[column for column in uncertainty_columns if column in df]], use_container_width=True)
@@ -215,6 +224,10 @@ def main():
         if "summary" in reports:
             st.caption("Model and baseline performance over chronological held-out races")
             st.dataframe(pd.read_parquet(reports["summary"]), use_container_width=True)
+        if "confidence" in reports:
+            with st.expander("Race-block bootstrap intervals and paired differences versus grid"):
+                st.caption("Intervals are omitted with fewer than five held-out races; these are not guarantees of future skill.")
+                st.dataframe(pd.read_parquet(reports["confidence"]), use_container_width=True)
         if "reliability" in reports:
             with st.expander("Probability reliability by bin"):
                 st.dataframe(pd.read_parquet(reports["reliability"]), use_container_width=True)
@@ -236,7 +249,8 @@ def main():
         st.markdown("---")
         st.markdown("### 🎲 Derived Race Simulation & Scenario Analysis")
         st.caption(
-            "Scenario outputs are derived from the same model strengths and reliability forecast; they are not an independent prediction.")
+            "Scenario outputs reuse saved strengths, retirement risks, temperature, seed and simulation count. "
+            "They are not an independent prediction.")
         simulation_file: Optional[Path] = None
         if selected_file is not None and {"year", "round_number"}.issubset(df.columns):
             simulation_file = PREDICTIONS_DATA_DIR / (
@@ -262,15 +276,16 @@ def main():
             format_func=lambda key: SCENARIOS[key].name,
         )
         st.info(SCENARIOS[scenario_choice].description)
-
-        if st.button("Run Monte Carlo Simulation (2,000 Iterations)"):
+        if scenario_choice != "standard_dry":
+            st.warning("Heuristic sensitivity analysis: weather, safety-car and degradation multipliers are not learned or separately calibrated.")
+        required_inputs = {"strength", "base_dnf_probability", "pl_temperature", "simulation_count", "seed",
+                           "race_retirement_correlation"}
+        can_simulate = required_inputs.issubset(df.columns)
+        if not can_simulate:
+            st.info("Regenerate this legacy/demo forecast with the current model to enable consistent scenario analysis.")
+        if st.button("Run scenario with saved simulation settings", disabled=not can_simulate):
             with st.spinner("Simulating race iterations..."):
-                sim = MonteCarloRaceSimulator(n_simulations=2000)
-                sim_res = sim.simulate(
-                    df,
-                    scenario=scenario_choice,
-                    win_probabilities=df["win_probability"].to_numpy(dtype=float),
-                )
+                sim_res = simulate_saved_prediction(df, scenario_choice)
                 st.dataframe(
                     sim_res[[
                         "Abbreviation", "TeamName", "simulated_win_prob",

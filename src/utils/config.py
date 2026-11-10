@@ -61,7 +61,10 @@ TARGET_COLUMNS = [
     "target_dnf_collision",
 ]
 
-NON_FEATURE_COLUMNS = set(METADATA_COLUMNS + TARGET_COLUMNS + ["Position", "Points", "GridPosition"])
+NON_FEATURE_COLUMNS = set(METADATA_COLUMNS + TARGET_COLUMNS + [
+    "Position", "Points", "GridPosition",
+    "prior_weekend_best_lap_seconds", "prior_weekend_mean_lap_seconds",
+])
 
 
 def get_feature_columns(frame):

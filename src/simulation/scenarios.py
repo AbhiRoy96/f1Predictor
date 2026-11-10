@@ -94,5 +94,8 @@ SCENARIOS: Dict[str, RaceScenario] = {
 
 
 def get_scenario(scenario_name: str = "standard_dry") -> RaceScenario:
-    """Retrieve scenario configuration by key, defaulting to standard dry."""
-    return SCENARIOS.get(scenario_name.lower(), SCENARIOS["standard_dry"])
+    """Retrieve an explicit sensitivity scenario; unknown names are errors."""
+    key = scenario_name.lower()
+    if key not in SCENARIOS:
+        raise ValueError(f"Unknown scenario {scenario_name!r}; choose from {', '.join(SCENARIOS)}")
+    return SCENARIOS[key]
