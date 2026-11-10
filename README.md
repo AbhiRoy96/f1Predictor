@@ -1,7 +1,11 @@
----
-title: F1 Race Intelligence and Prediction
-description: Setup, prediction workflows, model assumptions, and operations for the F1 forecasting pipeline and Streamlit dashboard.
----
+# 🏎️ F1 Race Intelligence and Prediction
+
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Streamlit App](https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B.svg)](https://streamlit.io/)
+[![CI Tests](https://github.com/AbhiRoy96/f1Predictor/actions/workflows/tests.yml/badge.svg)](./.github/workflows/tests.yml)
+
+> **Probabilistic race forecasting pipeline, point-in-time feature engineering, Bayesian & XGBoost strength models, and interactive Streamlit analytics for Formula 1.**
 
 ## Overview
 
