@@ -1,13 +1,22 @@
 """Evaluation metrics and chronological backtesting for F1 race predictions."""
 
-from typing import Any, Callable, Dict, List, Optional
+import json
 from inspect import signature
 from pathlib import Path
-import json
+from typing import Any, Callable, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
-from sklearn.metrics import average_precision_score, brier_score_loss, f1_score, mean_absolute_error, precision_score, recall_score
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    f1_score,
+    mean_absolute_error,
+    precision_score,
+    recall_score,
+)
+
 from src.utils.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -227,6 +236,7 @@ def _baseline_strength(df, name):
 
 def _complete_race_metrics(frame):
     from scipy.stats import kendalltau
+
     from src.models.calibrate import pl_nll
 
     position = frame.target_position.to_numpy(float)
@@ -304,7 +314,8 @@ def bootstrap_race_metrics(metrics, seed=42):
     return pd.DataFrame(rows, columns=columns)
 
 
-def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=2000, seed=42):
+def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=2000, seed=42,
+                          strength_model="legacy"):
     """Shared expanding folds, in memory only.
 
     Returns DataFrames: predictions (race model), baselines (long, model=grid/
@@ -314,7 +325,12 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
     Position errors are predicted minus actual; rolling bias uses the latest five races.
     """
     from src.models.calibrate import fit_simulation_temperature
-    from src.models.race_model import RacePredictor, chronological_races, dnf_labels, race_groups
+    from src.models.race_model import (
+        RacePredictor,
+        chronological_races,
+        dnf_labels,
+        race_groups,
+    )
     from src.simulation.race_simulator import MonteCarloRaceSimulator, session_scenario
 
     if min_train_races < 1 or refit_every < 1 or n_simulations < 1:
@@ -335,14 +351,15 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
             test = test.sort_values("Abbreviation").reset_index(drop=True)
         if (i - min_train_races) % refit_every == 0:
             train = df.iloc[np.concatenate(races[:i])].reset_index(drop=True)
-            model = RacePredictor()
+            model = RacePredictor(**({"strength_model": strength_model} if strength_model != "legacy" else {}))
             model.random_seed = seed
             model.fit(train)
             dnf_model = model.dnf_model_
             train_end = model.metadata_["training_end"]
             baseline_calibration = {}
             for name in ["grid", "championship", "team"]:
-                examples = [dict(example, strength=_baseline_strength(example["frame"], name))
+                examples = [dict(example, strength=_baseline_strength(example["frame"], name),
+                                 strength_covariance=None)
                             for example in model.calibration_examples_]
                 temperature = fit_simulation_temperature(examples, seed=seed)
                 baseline_calibration[name] = {"pl_temperature": temperature,

@@ -58,7 +58,53 @@ This option is a backtest, not a way to create a pre-event forecast. It fails wh
 
 Collection fills missing elapsed sessions only for selected weekends and fails clearly if required selected data remains absent. Feature files are content-addressed and support `pre_weekend`, `post_fp`, and `post_quali` stages.
 
-Useful options are `--stage`, `--skip-collection`, `--model-path`, `--n-simulations`, `--seed`, `--scenario`, `--events-per-season`, `--similar-circuits`, and `--measure-variation`. Backtests use temporary artifacts and never modify `models/`.
+Useful options are `--stage`, `--skip-collection`, `--model-path`, `--strength-model`, `--n-simulations`, `--seed`, `--scenario`, `--events-per-season`, `--similar-circuits`, and `--measure-variation`. Backtests use temporary artifacts and never modify `models/`.
+
+## Dynamic Bayesian experiment
+
+On this branch, CLI commands default to `--strength-model bayesian`.
+Use `--strength-model legacy` to retain the original XGBoost/logistic model.
+Python APIs retain their legacy default for compatibility.
+
+```powershell
+python main.py train race 2026 "Brazilian Grand Prix" --strength-model bayesian --skip-collection
+python main.py predict race 2026 "Brazilian Grand Prix" --strength-model bayesian --skip-collection
+python main.py evaluate race 2026 "Brazilian Grand Prix" --strength-model bayesian --skip-collection
+python main.py evaluate race 2026 "Brazilian Grand Prix" --strength-model legacy --skip-collection
+```
+
+The challenger models conditional-finisher order with a Plackett-Luce likelihood.
+Driver and constructor effects use zero-sum contrasts, Gaussian shrinkage priors,
+and random-walk evolution. Standardized pre-event grid, form, qualifying and
+practice features supply regularized contextual effects. Each chronological
+race produces a Laplace Gaussian update; this is approximate Bayesian inference,
+not MCMC and not a causal separation of driver skill from car performance.
+
+Prior standard deviations are 0.5 for drivers and context coefficients and 1.0
+for constructors. Per-14-day process standard deviations are 0.035 for drivers
+and 0.10 for constructors. Crossing a 2022 or 2026 regulation boundary retains
+one quarter of constructor means and restores constructor prior variance.
+These are fixed experimental assumptions, not empirically optimized parameters.
+Unseen entities receive zero-mean prior effects; teammates share constructor
+uncertainty. Predictions must be strictly after the last training race.
+
+Final win/podium calibration uses past-only expanding-fold forecasts and includes
+the same joint strength covariance and retirement process used at inference.
+Each simulation samples correlated latent strengths as well as race outcomes.
+Saved covariance rows and their driver order allow exact seeded dashboard replay,
+including after a parquet round trip or row shuffle.
+
+Metadata identifies `race_bayesian_laplace_v1` and
+`laplace_strength_and_outcome_uncertainty`. Outcome intervals are not credible
+intervals for individual model parameters. Retirement parameters, prior scales,
+model selection and calibration uncertainty are not integrated out.
+Model fingerprints include the selected variant; Bayesian prediction and report
+filenames include `_bayesian` so legacy outputs are not overwritten.
+
+No accuracy improvement is assumed. Compare both variants on identical later
+held-out races before selecting one. Existing grid-baseline and limited-sample
+calibration cautions still apply. More simulations reduce numerical noise, not
+model misspecification. NumPy/SciPy supply the inference without new dependencies.
 
 ## Bounded historical collection
 
@@ -86,7 +132,7 @@ The collector logs the exact selected events before loading their missing sessio
 
 ## Prediction consistency and assumptions
 
-The v2 model trains competitive strength on non-retired drivers rather than penalizing retirements in both ranking and simulation. Ranking and logistic components use a 30-event recency half-life; examples from earlier regulation eras receive one-quarter weight. Recent form is era-specific, and sprint/Grand Prix histories and qualifying formats are separate.
+Both models train competitive strength on non-retired drivers rather than penalizing retirements in both ranking and simulation. Legacy ranking and logistic components use a 30-event recency half-life; examples from earlier regulation eras receive one-quarter weight. The Bayesian challenger uses the state evolution described above. Recent form is era-specific, and sprint/Grand Prix histories and qualifying formats are separate.
 
 Qualifying gaps compare the same Q1, Q2 or Q3 phase. Practice pace excludes deleted, inaccurate, flagged and pit laps when those flags are available. Long-run residuals compare multiple drivers within the same session, compound, tyre age and ten-minute track-time cohort when timestamps exist. Sample count, dispersion and timestamp coverage expose weak comparisons. Fuel load is unobserved, so these remain imperfect pace estimates.
 
@@ -98,7 +144,7 @@ All position probabilities, win/podium/top-10 probabilities and expected positio
 
 Qualifying predictions disable race retirement and safety-car processes. Non-reference scenarios are labeled heuristic sensitivity analyses. Their rain, safety-car and degradation multipliers are not learned driver-specific effects and are not separately calibrated.
 
-Remaining assumptions include Plackett-Luce relative odds, a constant-hazard retirement-distance proxy, finishers preceding retirees, and no lap-level fuel, strategy or lapped-car classification model. This repair does not introduce a Bayesian driver/car decomposition or claim that driver skill is causally identified.
+Remaining assumptions include Plackett-Luce relative odds, a constant-hazard retirement-distance proxy, finishers preceding retirees, and no lap-level fuel, strategy or lapped-car classification model. Only the Bayesian challenger introduces a latent driver/car decomposition; neither variant claims that driver skill is causally identified.
 
 ## Validation and uncertainty
 
@@ -108,7 +154,7 @@ Reports include winner/podium/top-10/DNF Brier scores, winner and podium log los
 
 The confidence report uses 500 circular race-block bootstrap samples, including paired differences versus the grid baseline. Blocks have length `ceil(number_of_races ** (1/3))`. Intervals are omitted with fewer than five held-out races. These intervals describe the sampled backtest, not a guarantee of improvement or a remedy for selective circuit coverage.
 
-P10-P90 position ranges describe conditional simulated outcomes, not posterior parameter confidence. `win_probability_mcse` describes approximate numerical Monte Carlo error only. More simulations reduce sampling noise, not model misspecification. Calibration must still be checked on later held-out races before trusting the forecasts.
+Legacy P10-P90 position ranges describe conditional simulated outcomes. Bayesian ranges also integrate approximate latent-strength uncertainty. Neither is a confidence interval for model parameters. `win_probability_mcse` describes approximate numerical Monte Carlo error only. More simulations reduce sampling noise, not model misspecification. Calibration must still be checked on later held-out races before trusting the forecasts.
 
 Old model artifacts fail the data/code fingerprint check and must be retrained. Legacy/demo predictions remain viewable, but scenario replay is disabled until forecasts contain the current latent-input fields.
 

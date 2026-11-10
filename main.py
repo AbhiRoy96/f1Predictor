@@ -3,10 +3,10 @@
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import fastf1
 import joblib
@@ -15,7 +15,11 @@ import pandas as pd
 
 from src.data.collect_driver_constructor_stats import collect_driver_constructor_stats
 from src.data.collect_season import _resolve_event, _session_specs, collect_event
-from src.data.event_selection import DEFAULT_EVENTS_PER_SEASON, select_related_events, similar_circuit_keys
+from src.data.event_selection import (
+    DEFAULT_EVENTS_PER_SEASON,
+    select_related_events,
+    similar_circuit_keys,
+)
 from src.data.normalise_entities import normalise_driver_name
 from src.data.validate_data import validate_features_df
 from src.features.engineer_features import build_features, load_results
@@ -282,31 +286,35 @@ def _measure_prediction_variation(predictions, actuals):
     return measured, summary
 
 
-def _training_hash(training):
+def _training_hash(training, strength_model="legacy"):
     values = training.sort_index(axis=1).astype(str)
     data = pd.util.hash_pandas_object(values, index=False).to_numpy().tobytes()
     paths = [*Path("src/models").glob("*.py"), *Path("src/simulation").glob("*.py"),
              Path("src/utils/config.py"), Path("src/data/outcomes.py")]
-    return _data_hash(paths, hashlib.sha256(data).hexdigest())
+    context = hashlib.sha256(data).hexdigest()
+    if strength_model != "legacy":
+        context += ":" + strength_model
+    return _data_hash(paths, context)
 
 
-def _train_models(feature_path, training_features=None, output_dir=None):
+def _train_models(feature_path, training_features=None, output_dir=None, strength_model="legacy"):
     """Train a single race model; temporary artifacts never enter models/."""
     from src.models.race_model import train_and_save_race_model
 
+    options = {"strength_model": strength_model} if strength_model != "legacy" else {}
     if training_features is None:
-        return train_and_save_race_model(feature_path, output_dir=output_dir)
+        return train_and_save_race_model(feature_path, output_dir=output_dir, **options)
     with tempfile.TemporaryDirectory(prefix="backtest_", dir=PROCESSED_DATA_DIR) as directory:
         temporary = Path(directory)
         training_path = temporary / Path(feature_path).name
         training_features.to_parquet(training_path, index=False)
-        artifacts = train_and_save_race_model(training_path, output_dir=temporary)
+        artifacts = train_and_save_race_model(training_path, output_dir=temporary, **options)
         # Load before the temporary directory is removed, with no production writes.
         return joblib.load(artifacts["model_path"])
 
 
-def _model_artifact(feature_path, training, stage, session, action, model_path=None):
-    fingerprint = _training_hash(training)
+def _model_artifact(feature_path, training, stage, session, action, model_path=None, strength_model="legacy"):
+    fingerprint = _training_hash(training, strength_model)
     if model_path is not None:
         artifact = joblib.load(model_path)
         metadata = artifact.get("metadata", {})
@@ -333,7 +341,8 @@ def _model_artifact(feature_path, training, stage, session, action, model_path=N
     output_dir.mkdir(parents=True, exist_ok=False)
     training_path = output_dir / "training_features.parquet"
     training.to_parquet(training_path, index=False)
-    artifacts = train_and_save_race_model(training_path, output_dir=output_dir)
+    options = {"strength_model": strength_model} if strength_model != "legacy" else {}
+    artifacts = train_and_save_race_model(training_path, output_dir=output_dir, **options)
     artifact = joblib.load(artifacts["model_path"])
     try:
         git_sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
@@ -379,7 +388,8 @@ def _validate_prediction_probabilities(predictions):
         raise ValueError("Predictions must satisfy win <= podium <= top10.")
 
 
-def _evaluate(features, session, year, target_round, stage, seed=42, n_simulations=20000):
+def _evaluate(features, session, year, target_round, stage, seed=42, n_simulations=20000,
+              strength_model="legacy"):
     from src.models.evaluate import run_race_walk_forward
 
     keys = ["Year", "RoundNumber"]
@@ -394,11 +404,14 @@ def _evaluate(features, session, year, target_round, stage, seed=42, n_simulatio
         features = features.loc[complete].copy()
     if len(features[keys].drop_duplicates()) < 9:
         raise ValueError("Walk-forward evaluation needs at least nine completed events (eight training, one held out).")
-    result = run_race_walk_forward(features, seed=seed, n_simulations=n_simulations)
+    options = {"strength_model": strength_model} if strength_model != "legacy" else {}
+    result = run_race_walk_forward(features, seed=seed, n_simulations=n_simulations, **options)
     if result["metrics"].empty:
         raise ValueError("Walk-forward evaluation needs at least nine completed events (eight training, one held out).")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     prefix = f"walk_forward_{session}_{year}_rnd{target_round}_{stage}"
+    if strength_model != "legacy":
+        prefix += "_" + strength_model
     for name, value in result.items():
         if isinstance(value, pd.DataFrame):
             value.to_parquet(REPORTS_DIR / f"{prefix}_{name}.parquet", index=False)
@@ -411,7 +424,11 @@ def _evaluate(features, session, year, target_round, stage, seed=42, n_simulatio
 def run_pipeline(session, year, event, measure_variation=False, *, stage="post_quali",
                  skip_collection=False, action="auto", model_path=None, n_simulations=20000,
                  seed=42, scenario="standard_dry", events_per_season=DEFAULT_EVENTS_PER_SEASON,
-                 similar_circuits=None):
+                 similar_circuits=None, strength_model="legacy"):
+    from src.models.race_model import STRENGTH_MODELS
+
+    if strength_model not in STRENGTH_MODELS:
+        raise ValueError(f"Unknown strength model {strength_model!r}; choose {STRENGTH_MODELS}")
     if n_simulations <= 0:
         raise ValueError("n_simulations must be positive.")
     feature_path = ensure_processed_data(session, year, event, stage, skip_collection,
@@ -425,14 +442,14 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
     if action == "evaluate":
         cutoff = pd.to_datetime(target.SessionStartUtc, utc=True).min()
         return _evaluate(features.loc[pd.to_datetime(features.SessionStartUtc, utc=True) <= cutoff],
-                         session, year, target_round, stage, seed, n_simulations)
+                         session, year, target_round, stage, seed, n_simulations, strength_model)
     if measure_variation:
         training, target = _prepare_backtest_data(features, year, target_round, event_name, session)
         PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        artifact = _train_models(feature_path, training)
+        artifact = _train_models(feature_path, training, strength_model=strength_model)
     else:
         training = _training_before(features, target)
-        artifact = _model_artifact(feature_path, training, stage, session, action, model_path)
+        artifact = _model_artifact(feature_path, training, stage, session, action, model_path, strength_model)
     if action == "train":
         logger.info("Model trained: %s", artifact.get("metadata", {}).get("model_version"))
         return artifact
@@ -449,6 +466,7 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
     run_metadata = {"session": session, "year": year, "round_number": target_round,
                     "event_name": event_name, "prediction_generated_at_utc": pd.Timestamp.now(tz="UTC"),
                     "variation_measured": measure_variation, "stage": stage,
+                    "strength_model": strength_model,
                     "model_version": metadata.get("model_version", "held_out_" + _training_hash(training)[:12]),
                     "training_start_utc": str(training.SessionStartUtc.min()),
                     "training_end_utc": str(training.SessionStartUtc.max()),
@@ -463,6 +481,8 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
         predictions[name] = value
     PREDICTIONS_DATA_DIR.mkdir(parents=True, exist_ok=True)
     stem = f"{session}_{year}_rnd{target_round}"
+    if strength_model != "legacy":
+        stem += "_" + strength_model
     predictions.to_parquet(PREDICTIONS_DATA_DIR / f"predictions_{stem}_{stage}.parquet", index=False)
     predictions.to_parquet(PREDICTIONS_DATA_DIR / f"predictions_{stem}.parquet", index=False)
     if summary is not None:
@@ -478,6 +498,8 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
 
 
 def main(argv=None):
+    from src.models.race_model import DEFAULT_STRENGTH_MODEL, STRENGTH_MODELS
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     action = arguments.pop(0) if arguments and arguments[0] in {"train", "predict", "evaluate"} else "auto"
     parser = argparse.ArgumentParser(description="Train, predict or evaluate an F1 session")
@@ -488,6 +510,8 @@ def main(argv=None):
     parser.add_argument("--stage", choices=STAGES, default="post_quali")
     parser.add_argument("--skip-collection", action="store_true")
     parser.add_argument("--model-path", type=Path)
+    parser.add_argument("--strength-model", choices=STRENGTH_MODELS, default=DEFAULT_STRENGTH_MODEL,
+                        help="Competitive-strength model; legacy retains the original ranker/logit blend")
     parser.add_argument("--n-simulations", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--scenario", default="standard_dry")
@@ -507,7 +531,7 @@ def main(argv=None):
     options = dict(stage=args.stage, skip_collection=args.skip_collection, action=action,
                    model_path=args.model_path, n_simulations=args.n_simulations, seed=args.seed,
                    scenario=args.scenario, events_per_season=args.events_per_season,
-                   similar_circuits=args.similar_circuits)
+                   similar_circuits=args.similar_circuits, strength_model=args.strength_model)
     return run_pipeline(args.session, args.year, args.event, measure_variation=args.measure_variation, **options)
 
 

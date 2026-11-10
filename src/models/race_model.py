@@ -1,5 +1,6 @@
 """One strength model and retirement model feeding coherent race simulations."""
 
+import json
 from pathlib import Path
 
 import joblib
@@ -21,6 +22,9 @@ from src.utils.logging import setup_logger
 
 logger = setup_logger(__name__)
 MODEL_VERSION = "race_pl_v2"
+STRENGTH_MODELS = ("legacy", "bayesian")
+DEFAULT_STRENGTH_MODEL = "bayesian"
+MODEL_VERSIONS = {"legacy": MODEL_VERSION, "bayesian": "race_bayesian_laplace_v1"}
 LOGIT_FEATURES = ["grid_position", "quali_position", "quali_gap_to_pole_pct",
                   "driver_race_form_5", "driver_race_era_strength_position",
                   "driver_race_season_avg_position", "driver_race_season_points_per_start",
@@ -174,12 +178,24 @@ class ShrinkageDNFModel:
 class RacePredictor:
     """Regularized ranker/logit blend; all calibrators see forward-held-out scores only."""
 
-    def __init__(self, random_seed=42, n_estimators=100, oof_splits=4):
+    def __init__(self, random_seed=42, n_estimators=100, oof_splits=4, strength_model="legacy"):
+        if strength_model not in STRENGTH_MODELS:
+            raise ValueError(f"Unknown strength model {strength_model!r}; choose {STRENGTH_MODELS}")
         self.random_seed = random_seed
         self.n_estimators = n_estimators
         self.oof_splits = oof_splits
+        self.strength_model = strength_model
 
     def _fit_strength(self, df, races):
+        if self.strength_model == "bayesian":
+            from src.models.bayesian_strength import DynamicBayesianStrength
+
+            context = [c for c in LOGIT_FEATURES + ["fp2_long_run_pace_rank", "fp_best_lap_gap_pct",
+                                                   "fp_teammate_gap_pct"] if c in self.feature_columns_]
+            return DynamicBayesianStrength().fit(df, context)
+        return self._fit_legacy_strength(df, races)
+
+    def _fit_legacy_strength(self, df, races):
         neutral_position = float(np.median([len(rows) + 1 for rows in races]) / 2)
         imputer = NeutralRaceImputer(neutral_position)
         features = df.reindex(columns=self.feature_columns_).replace([np.inf, -np.inf], np.nan)
@@ -223,6 +239,9 @@ class RacePredictor:
         rank_scores = ranker.predict(imputer.transform(x)) if ranker is not None else np.zeros(len(df))
         return np.column_stack([rank_scores, logit_scores])
 
+    def _strength_distribution(self, df, components):
+        return components.posterior(df)
+
     def fit(self, df):
         if df.empty or "target_position" not in df:
             raise ValueError("Training requires nonempty races with target_position")
@@ -246,6 +265,7 @@ class RacePredictor:
         if not self.feature_columns_:
             raise ValueError("No numeric pre-race features")
         oof_scores, oof_frames, oof_risks, oof_correlations, folds = [], [], [], [], []
+        oof_covariances = []
         first = max(2, len(races) // 3)
         for block in np.array_split(np.arange(first, len(races)), max(1, self.oof_splits)):
             if not len(block):
@@ -256,7 +276,13 @@ class RacePredictor:
             risk_model = ShrinkageDNFModel().fit(train)
             for i in block:
                 valid = ordered.iloc[races[i]].reset_index(drop=True)
-                oof_scores.append(self._scores(valid, components))
+                if self.strength_model == "legacy":
+                    oof_scores.append(self._scores(valid, components))
+                    oof_covariances.append(None)
+                else:
+                    mean, covariance = self._strength_distribution(valid, components)
+                    oof_scores.append(np.column_stack([mean, np.zeros(len(valid))]))
+                    oof_covariances.append(covariance)
                 oof_frames.append(valid)
                 oof_risks.append(np.zeros(len(valid)) if "SessionType" in valid and
                                  valid.SessionType.isin(["Q", "SQ"]).all() else risk_model.predict(valid))
@@ -267,8 +293,8 @@ class RacePredictor:
                           "train_max_utc": str(train.SessionStartUtc.max()) if "SessionStartUtc" in train else None,
                           "validation_min_utc": str(ordered.iloc[races[block[0]]].SessionStartUtc.min()) if "SessionStartUtc" in ordered else None})
         conditional = [np.flatnonzero(~dnf_labels(frame)[0].eq(1).to_numpy()) for frame in oof_frames]
-        self.blend_weights_ = np.array([0.5, 0.5])
-        if oof_scores:
+        self.blend_weights_ = np.array([0.5, 0.5] if self.strength_model == "legacy" else [1.0, 0.0])
+        if oof_scores and self.strength_model == "legacy":
             def loss(weight):
                 losses = []
                 for scores, frame, rows in zip(oof_scores, oof_frames, conditional):
@@ -283,8 +309,10 @@ class RacePredictor:
         blended = [scores @ self.blend_weights_ for scores in oof_scores]
         self.temperature_ = 1.0
         self.calibration_examples_ = [
-            {"frame": frame, "strength": strength, "p_dnf": risk, "race_correlation": correlation}
-            for frame, strength, risk, correlation in zip(oof_frames, blended, oof_risks, oof_correlations)]
+            {"frame": frame, "strength": strength, "p_dnf": risk, "race_correlation": correlation,
+             "strength_covariance": covariance}
+            for frame, strength, risk, correlation, covariance in
+            zip(oof_frames, blended, oof_risks, oof_correlations, oof_covariances)]
         self.pl_temperature_ = fit_simulation_temperature(self.calibration_examples_, seed=self.random_seed)
         if len(blended) < 10:
             logger.warning("Only %s OOF races for calibration; probability calibration is weakly evidenced.", len(blended))
@@ -296,7 +324,9 @@ class RacePredictor:
                                         "pl_temperature_source": "oof_final_simulation" if blended else "default",
                                         "objective": "final_win_plus_podium_log_loss",
                                         "calibration_simulations": 1024, "seed": self.random_seed}
-        self.metadata_ = {"model_version": MODEL_VERSION, "n_train_races": len(races), "n_train_rows": len(ordered),
+        self.metadata_ = {"model_version": MODEL_VERSIONS[self.strength_model],
+                          "strength_model": self.strength_model,
+                          "n_train_races": len(races), "n_train_rows": len(ordered),
                           "training_start": str(ordered.SessionStartUtc.min()) if "SessionStartUtc" in ordered else race_groups(ordered).iloc[0],
                           "training_end": str(ordered.SessionStartUtc.max()) if "SessionStartUtc" in ordered else race_groups(ordered).iloc[-1],
                           "temperature": self.temperature_, "pl_temperature": self.pl_temperature_,
@@ -311,6 +341,16 @@ class RacePredictor:
                           "limitations": "constant_retirement_hazards; finishers_precede_retirees; no_fuel_load_data; no_parameter_posterior",
                           "dnf_fallback": "shrunk_total_risk_with_unknown_cause" if self.dnf_model_.total_fallback_ else
                           "beta_prior_for_missing_labels_and_unseen_entities"}
+        if self.strength_model != "legacy":
+            self.calibration_provenance_["weights_source"] = "fixed_single_bayesian_component"
+            self.metadata_.update({
+                "inference": "sequential_laplace_gaussian",
+                "identification": "zero_sum_driver_and_constructor_contrasts",
+                "recency_policy": "random_walk_14_day_units_constructor_reset_at_2022_and_2026",
+                "uncertainty_kind": "laplace_strength_and_outcome_uncertainty",
+                "limitations": "fixed_prior_and_process_scales; approximate_gaussian_posterior; "
+                               "driver_constructor_not_causal; constant_retirement_hazards; finishers_precede_retirees",
+            })
         return self
 
     def predict(self, df, n_simulations=20000, scenario="standard_dry", seed=42):
@@ -319,7 +359,9 @@ class RacePredictor:
         if df.empty:
             return df.copy()
         races = chronological_races(df)
-        strengths = self._scores(df, self.components_) @ self.blend_weights_ / self.temperature_
+        strength_model = getattr(self, "strength_model", "legacy")
+        strengths = (self._scores(df, self.components_) @ self.blend_weights_ / self.temperature_
+                     if strength_model == "legacy" else None)
         risks = self.dnf_model_.predict(df)
         components = self.dnf_model_.predict_components(df)
         if "SessionType" in df:
@@ -333,13 +375,19 @@ class RacePredictor:
             if driver_key:
                 rows = rows[np.argsort(df.iloc[rows][driver_key].astype(str).to_numpy(), kind="stable")]
             race = df.iloc[rows].copy().reset_index(drop=True)
+            if strengths is None:
+                race_strength, covariance = self._strength_distribution(race, self.components_)
+                posterior = {"strength_covariance": covariance}
+            else:
+                race_strength, covariance = strengths[rows], None
+                posterior = {}
             # Simulator sorts by win chance; positional IDs restore the caller's row order.
             grid = race.copy()
             grid["Abbreviation"] = np.arange(len(race))
             simulated = MonteCarloRaceSimulator(n_simulations, seed).simulate(
-                grid, session_scenario(race, scenario), strength=strengths[rows],
+                grid, session_scenario(race, scenario), strength=race_strength,
                 p_dnf=risks[rows], pl_temperature=self.pl_temperature_,
-                race_correlation=self.dnf_model_.race_correlation_)
+                race_correlation=self.dnf_model_.race_correlation_, **posterior)
             simulated = simulated.set_index("Abbreviation").reindex(np.arange(len(race))).reset_index(drop=True)
             identifiers = [c for c in METADATA_COLUMNS if c in race]
             for c in ["GridPosition", "grid_position", "Driver", "FullName"]:
@@ -349,14 +397,21 @@ class RacePredictor:
             for col in simulated:
                 if col not in {"Abbreviation", "TeamName"}:
                     result[col] = simulated[col].to_numpy()
-            result["strength"] = strengths[rows]
+            result["strength"] = race_strength
+            if covariance is not None:
+                result["strength_std"] = np.sqrt(np.maximum(np.diag(covariance), 0))
+                result["strength_covariance_row"] = [json.dumps(row.tolist()) for row in covariance]
+                result["strength_covariance_order"] = json.dumps(race[driver_key].astype(str).tolist())
+                if "Abbreviation" not in result:
+                    result["Abbreviation"] = race[driver_key].astype(str).to_numpy()
             result["base_dnf_probability"] = risks[rows]
             result["mechanical_dnf_probability"] = components["mechanical"][rows]
             result["collision_dnf_probability"] = components["collision"][rows]
             result["other_dnf_probability"] = components["other"][rows]
             result["scenario_kind"] = ("calibrated_reference" if scenario == "standard_dry"
                                        else "heuristic_sensitivity")
-            result["model_version"] = MODEL_VERSION
+            result["model_version"] = MODEL_VERSIONS[strength_model]
+            result["strength_model"] = strength_model
             result["training_start"] = self.metadata_["training_start"]
             result["training_end"] = self.metadata_["training_end"]
             result["n_train_races"] = self.metadata_["n_train_races"]
@@ -372,10 +427,10 @@ class RacePredictor:
         return result
 
 
-def train_and_save_race_model(feature_path, output_dir):
+def train_and_save_race_model(feature_path, output_dir, strength_model="legacy"):
     """Persist a joblib dict with model, feature_columns, metadata; no evaluation writes."""
     frame = pd.read_parquet(feature_path)
-    model = RacePredictor().fit(frame)
+    model = RacePredictor(strength_model=strength_model).fit(frame)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "race_model.joblib"

@@ -1,5 +1,7 @@
 """Vectorized Plackett-Luce finishing orders, including retired drivers."""
 
+import json
+
 import numpy as np
 import pandas as pd
 from scipy.special import ndtr
@@ -9,7 +11,8 @@ from src.utils.config import RANDOM_SEED
 
 
 def simulate_race(strength, p_dnf, n_sims=20000, pl_temperature=1.0,
-                  team_idx=None, team_sigma=0.0, seed=42, race_correlation=0.0):
+                  team_idx=None, team_sigma=0.0, seed=42, race_correlation=0.0,
+                  strength_covariance=None):
     """Return (places, retired), both shaped (simulations, drivers)."""
     strength = np.asarray(strength, dtype=float)
     p_dnf = np.asarray(p_dnf, dtype=float)
@@ -27,7 +30,18 @@ def simulate_race(strength, p_dnf, n_sims=20000, pl_temperature=1.0,
         raise ValueError("race_correlation must lie in [0, 1)")
     rng = np.random.default_rng(seed)
     n = len(strength)
-    util = strength / pl_temperature + rng.gumbel(size=(n_sims, n))
+    sampled_strength = strength
+    if strength_covariance is not None:
+        covariance = np.asarray(strength_covariance, dtype=float)
+        if (covariance.shape != (n, n) or not np.isfinite(covariance).all()
+                or not np.allclose(covariance, covariance.T, rtol=0, atol=1e-10)):
+            raise ValueError("Strength covariance must be finite, symmetric and shaped (drivers, drivers)")
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        if np.any(eigenvalues < -1e-10):
+            raise ValueError("Strength covariance must be positive semidefinite")
+        factor = eigenvectors * np.sqrt(np.maximum(eigenvalues, 0))
+        sampled_strength = strength + rng.normal(size=(n_sims, n)) @ factor.T
+    util = sampled_strength / pl_temperature + rng.gumbel(size=(n_sims, n))
     if team_idx is not None and team_sigma > 0 and n:
         team_idx = np.asarray(team_idx)
         if team_idx.shape != strength.shape or np.any(team_idx < 0):
@@ -125,11 +139,26 @@ def simulate_saved_prediction(predictions, scenario="standard_dry", n_simulation
         if "seed" not in frame:
             raise ValueError("Saved prediction has no seed")
         seed = int(frame.seed.iloc[0])
+    posterior = {}
+    covariance_columns = {"strength_covariance_row", "strength_covariance_order"}
+    if covariance_columns.intersection(frame.columns):
+        if not covariance_columns.issubset(frame.columns):
+            raise ValueError("Saved posterior requires covariance rows and driver order")
+        if frame.strength_covariance_order.nunique(dropna=False) != 1:
+            raise ValueError("Saved posterior contains inconsistent driver order")
+        order = json.loads(frame.strength_covariance_order.iloc[0])
+        identifiers = frame.Abbreviation.astype(str).tolist()
+        if len(order) != len(frame) or len(set(order)) != len(order) or set(order) != set(identifiers):
+            raise ValueError("Saved posterior driver order does not match the field")
+        covariance = np.asarray([json.loads(row) for row in frame.strength_covariance_row], dtype=float)
+        if covariance.shape != (len(frame), len(frame)):
+            raise ValueError("Saved posterior covariance has invalid dimensions")
+        posterior["strength_covariance"] = covariance[:, [order.index(name) for name in identifiers]]
     return MonteCarloRaceSimulator(n_simulations, seed).simulate(
         frame, session_scenario(frame, scenario), strength=frame.strength.to_numpy(float),
         p_dnf=frame.base_dnf_probability.to_numpy(float),
         pl_temperature=float(frame.pl_temperature.iloc[0]),
-        race_correlation=float(frame.race_retirement_correlation.iloc[0]))
+        race_correlation=float(frame.race_retirement_correlation.iloc[0]), **posterior)
 
 
 class MonteCarloRaceSimulator:
@@ -142,7 +171,8 @@ class MonteCarloRaceSimulator:
         self.random_seed = random_seed
 
     def simulate(self, drivers_df, scenario="standard_dry", win_probabilities=None,
-                 strength=None, p_dnf=None, pl_temperature=1.0, race_correlation=0.0):
+                 strength=None, p_dnf=None, pl_temperature=1.0, race_correlation=0.0,
+                 strength_covariance=None):
         sc = get_scenario(scenario) if isinstance(scenario, str) else scenario
         if not isinstance(sc, RaceScenario):
             raise TypeError("scenario must be a name or RaceScenario")
@@ -194,14 +224,16 @@ class MonteCarloRaceSimulator:
                 strength, np.clip(risks * (1 + 0.4 * bool(code & 4)), 0, 1),
                 int(mask.sum()), temperature * scale, team_idx,
                 sc.team_sigma * sc.tyre_deg_multiplier, int(rng.integers(0, 2**32)),
-                race_correlation=race_correlation)
+                race_correlation=race_correlation, strength_covariance=strength_covariance)
         result = summarize_positions(positions, retired)
         result["Abbreviation"] = drivers.get("Abbreviation", drivers.get("Driver", pd.Series(np.arange(n))))
         result["TeamName"] = drivers.get("TeamName", "Unknown")
         result["scenario"] = scenario if isinstance(scenario, str) else sc.name
         result["scenario_kind"] = ("calibrated_reference" if scenario == "standard_dry"
                                    else "heuristic_sensitivity")
-        result["uncertainty_kind"] = "conditional_outcomes_not_parameter_confidence"
+        result["uncertainty_kind"] = ("laplace_strength_and_outcome_uncertainty"
+                                      if strength_covariance is not None
+                                      else "conditional_outcomes_not_parameter_confidence")
         result["simulation_count"] = self.n_simulations
         result["seed"] = self.random_seed
         result["pl_temperature"] = pl_temperature

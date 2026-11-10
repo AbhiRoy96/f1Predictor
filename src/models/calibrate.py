@@ -1,7 +1,8 @@
 """Probability calibration and race-level distribution reconciliation."""
 
-from typing import Optional
 import re
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
@@ -29,10 +30,12 @@ def fit_simulation_temperature(examples, default=1.0, n_simulations=1024, seed=4
                 frame = example["frame"].reset_index(drop=True)
                 grid = frame.copy()
                 grid["Abbreviation"] = np.arange(len(frame))
+                posterior = ({"strength_covariance": example["strength_covariance"]}
+                             if example.get("strength_covariance") is not None else {})
                 prediction = MonteCarloRaceSimulator(n_simulations, seed + i).simulate(
                     grid, session_scenario(frame), strength=example["strength"],
                     p_dnf=example["p_dnf"], pl_temperature=key,
-                    race_correlation=example.get("race_correlation", 0.0))
+                    race_correlation=example.get("race_correlation", 0.0), **posterior)
                 prediction = prediction.set_index("Abbreviation").reindex(np.arange(len(frame)))
                 position = frame.target_position.to_numpy(float)
                 winner = int(position.argmin())
