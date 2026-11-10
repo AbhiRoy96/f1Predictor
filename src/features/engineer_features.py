@@ -302,9 +302,11 @@ def _weekend_features(target, abbreviation, laps, weather, messages, results):
     prior_weather = _prior_weekend_rows(weather, target)
     for column in WEATHER_COLUMNS:
         if column in prior_weather:
-            values = pd.to_numeric(prior_weather[column], errors="coerce")
+            values = pd.to_numeric(prior_weather[column], errors="coerce").astype(float)
             features[f"prior_weekend_{column.casefold()}_mean"] = values.mean()
-            features[f"prior_weekend_{column.casefold()}_last"] = values.iloc[-1] if values.notna().any() else np.nan
+            features[f"prior_weekend_{column.casefold()}_last"] = (
+                values.dropna().iloc[-1] if values.notna().any() else np.nan
+            )
         else:
             features[f"prior_weekend_{column.casefold()}_mean"] = np.nan
             features[f"prior_weekend_{column.casefold()}_last"] = np.nan

@@ -223,6 +223,28 @@ class FeatureImprovementTests(unittest.TestCase):
         self.assertNotIn("prior_weekend_best_lap_seconds", get_feature_columns(table))
         self.assertNotIn("prior_weekend_mean_lap_seconds", get_feature_columns(table))
 
+    def test_weather_boolean_rainfall_produces_numeric_features(self):
+        weather = pd.DataFrame([
+            dict(Year=2026, RoundNumber=1, SessionType="FP1",
+                 SessionStartUtc=pd.Timestamp("2026-03-01T12:00Z"),
+                 AirTemp=25.0, TrackTemp=35.0, Humidity=60.0, Pressure=1013.0, WindSpeed=5.0,
+                 Rainfall=False),
+            dict(Year=2026, RoundNumber=1, SessionType="FP2",
+                 SessionStartUtc=pd.Timestamp("2026-03-02T12:00Z"),
+                 AirTemp=24.0, TrackTemp=32.0, Humidity=65.0, Pressure=1012.0, WindSpeed=6.0,
+                 Rainfall=True),
+        ])
+        for stage in features.STAGES:
+            table = features.build_features(self.results, self.laps, weather, self.messages, stage=stage)["R"]
+            self.assertTrue(pd.api.types.is_numeric_dtype(table["prior_weekend_rainfall_last"]))
+            self.assertTrue(pd.api.types.is_numeric_dtype(table["prior_weekend_rainfall_mean"]))
+            valid, errors = validate_features_df(table)
+            self.assertTrue(valid, errors)
+            if stage in ("post_fp", "post_quali"):
+                row = table.query("Year == 2026 and Abbreviation == 'NEW'").iloc[0]
+                self.assertEqual(row["prior_weekend_rainfall_last"], 1.0)
+                self.assertEqual(row["prior_weekend_rainfall_mean"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

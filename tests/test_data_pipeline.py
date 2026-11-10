@@ -401,6 +401,59 @@ class CollectionTests(unittest.TestCase):
             saved = pd.read_parquet(output / "2025_r_results.parquet")
             self.assertEqual(saved.loc[0, "Abbreviation"], "AAA")
 
+    def test_collect_event_falls_back_to_session_name_when_session_type_fails(self):
+        event = {
+            "EventName": "Qatar Grand Prix",
+            "RoundNumber": 17,
+            "Session1": "Sprint Shootout",
+            "Session1DateUtc": "2023-10-07T13:20:00Z",
+        }
+        fake_session = SimpleNamespace(
+            results=pd.DataFrame([{"Abbreviation": "PIA"}]),
+            laps=pd.DataFrame(),
+            weather_data=pd.DataFrame(),
+            race_control_messages=pd.DataFrame(),
+            load=lambda **kwargs: None,
+        )
+
+        def mock_get_session(year, round_num, identifier):
+            if identifier == "SQ":
+                raise ValueError("Session type 'SQ' does not exist for this event")
+            if identifier == "Sprint Shootout":
+                return fake_session
+            raise ValueError(f"Unknown identifier {identifier}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(collect_season, "OUTPUT", Path(directory)), patch.object(
+                collect_season, "_CACHE_ENABLED", True
+            ), patch.object(collect_season.fastf1, "get_session", side_effect=mock_get_session):
+                collected = collect_season.collect_event(
+                    2023, "Qatar Grand Prix", event=event, now="2023-10-08T00:00:00Z", raise_on_failure=True
+                )
+            self.assertEqual(collected, ["SQ"])
+            saved = pd.read_parquet(Path(directory) / "2023_sq_results.parquet")
+            self.assertEqual(saved.loc[0, "Abbreviation"], "PIA")
+
+    def test_collect_event_ignores_non_existent_session_error(self):
+        event = {
+            "EventName": "Test Grand Prix",
+            "RoundNumber": 1,
+            "Session1": "Sprint Shootout",
+            "Session1DateUtc": "2023-10-07T13:20:00Z",
+        }
+
+        def mock_get_session(year, round_num, identifier):
+            raise ValueError("Session type 'SQ' does not exist for this event")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(collect_season, "OUTPUT", Path(directory)), patch.object(
+                collect_season, "_CACHE_ENABLED", True
+            ), patch.object(collect_season.fastf1, "get_session", side_effect=mock_get_session):
+                collected = collect_season.collect_event(
+                    2023, "Test Grand Prix", event=event, now="2023-10-08T00:00:00Z", raise_on_failure=True
+                )
+            self.assertEqual(collected, [])
+
 
 class MasterDataTests(unittest.TestCase):
     def test_master_data_reads_race_and_new_session_results(self):

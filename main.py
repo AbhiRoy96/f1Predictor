@@ -92,6 +92,10 @@ def collect_historical_data(year: int, event: str, events_per_season=DEFAULT_EVE
                     if still_missing:
                         failures.append(f"{collection_year} {scheduled_event['EventName']}: {sorted(still_missing)}")
                 except Exception as exc:
+                    if "does not exist for this event" in str(exc).lower():
+                        logger.warning("Ignoring non-existent session error for %s %s: %s",
+                                       collection_year, scheduled_event['EventName'], exc)
+                        continue
                     failures.append(f"{collection_year} {scheduled_event['EventName']}: {exc}")
         except Exception as exc:
             failures.append(f"{collection_year} schedule: {exc}")

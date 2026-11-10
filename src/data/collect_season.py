@@ -212,9 +212,15 @@ def collect_event(year: int, event_name: str, event=None, now=None, raise_on_fai
                 session_identifier = event.get("EventName")
                 if not isinstance(session_identifier, str):
                     session_identifier = event_name
-            session = fastf1.get_session(year, session_identifier, session_type)
+            try:
+                session = fastf1.get_session(year, session_identifier, session_type)
+            except Exception:
+                session = fastf1.get_session(year, session_identifier, session_name)
             session.load(laps=True, telemetry=False, weather=True, messages=True)
         except Exception as exc:
+            if "does not exist for this event" in str(exc).lower():
+                print(f"Skipping non-existent session {event_name} {session_name}: {exc}")
+                continue
             print(f"Skipping {event_name} {session_name}: {exc}")
             failures.append(f"{session_name}: {exc}")
             continue
@@ -279,6 +285,9 @@ def collect_season(year: int):
         try:
             collect_event(year, event_name, event=event, raise_on_failure=True)
         except Exception as exc:
+            if "does not exist for this event" in str(exc).lower():
+                print(f"Ignoring non-existent session in {year} {event_name}: {exc}")
+                continue
             print(f"Failed to collect {year} {event_name}: {exc}")
             failures.append(f"{event_name}: {exc}")
 
