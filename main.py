@@ -2,6 +2,7 @@
 
 import argparse
 from pathlib import Path
+import tempfile
 import joblib
 import numpy as np
 import pandas as pd
@@ -111,10 +112,111 @@ def _select_target_event(features, year, round_number, event_name, session):
     return selected
 
 
+def _validate_completed_target_results(target_event_df: pd.DataFrame) -> None:
+    """Reject target sessions whose recorded outcomes are not complete enough to score."""
+    target_columns = ["target_winner", "target_podium", "target_position"]
+    missing_columns = [column for column in target_columns if column not in target_event_df]
+    if missing_columns:
+        raise ValueError(
+            "Variation measurement requires completed target results; missing "
+            f"columns: {', '.join(missing_columns)}."
+        )
+
+    targets = target_event_df[target_columns].apply(pd.to_numeric, errors="coerce")
+    if targets.isna().any().any() or not np.isfinite(targets.to_numpy()).all():
+        raise ValueError(
+            "Variation measurement requires completed target results; one or more "
+            "winner, podium, or finishing-position outcomes are missing."
+        )
+    if not targets["target_winner"].isin([0, 1]).all() or targets["target_winner"].sum() != 1:
+        raise ValueError("Variation measurement requires exactly one completed event winner.")
+    if not targets["target_podium"].isin([0, 1]).all():
+        raise ValueError("Variation measurement requires valid completed podium outcomes.")
+    if (targets["target_position"] <= 0).any():
+        raise ValueError("Variation measurement requires valid completed finishing positions.")
+
+
+def _prepare_backtest_data(features, year, round_number, event_name, session):
+    """Return training rows and a validated held-out event for leakage-safe scoring."""
+    held_out = _select_target_event(features, year, round_number, event_name, session)
+    _validate_completed_target_results(held_out)
+
+    year_values = pd.to_numeric(features["Year"], errors="coerce")
+    round_values = pd.to_numeric(features["RoundNumber"], errors="coerce")
+    target_mask = year_values.eq(year) & round_values.eq(round_number)
+    if "SessionType" in features:
+        session_code, _ = SESSION_TYPES[session]
+        target_mask &= features["SessionType"].eq(session_code)
+    training = features.loc[~target_mask].copy()
+
+    if training.empty:
+        raise ValueError("Not enough historical data remains to train after holding out the target event.")
+    if training["target_winner"].dropna().nunique() < 2:
+        raise ValueError("Not enough historical winner examples remain after holding out the target event.")
+    if training["target_podium"].dropna().nunique() < 2:
+        raise ValueError("Not enough historical podium examples remain after holding out the target event.")
+    if not (pd.to_numeric(training["target_position"], errors="coerce") > 0).any():
+        raise ValueError("Not enough historical finishing-position examples remain after the holdout.")
+    return training, held_out
+
+
+def _measure_prediction_variation(predictions: pd.DataFrame, actuals: pd.DataFrame):
+    """Join actual outcomes to held-out predictions and calculate event-level errors."""
+    outcome_columns = {
+        "target_winner": "actual_winner",
+        "target_podium": "actual_podium",
+        "target_position": "actual_position",
+    }
+    actual_results = actuals[["Abbreviation", *outcome_columns]].rename(columns=outcome_columns)
+    measured = predictions.merge(actual_results, on="Abbreviation", how="left", validate="one_to_one")
+    if measured[list(outcome_columns.values())].isna().any().any():
+        raise ValueError("Could not align all held-out predictions with their completed results.")
+
+    measured["win_probability_error"] = measured["win_probability"] - measured["actual_winner"]
+    measured["win_probability_absolute_error"] = measured["win_probability_error"].abs()
+    measured["podium_probability_error"] = measured["podium_probability"] - measured["actual_podium"]
+    measured["podium_probability_absolute_error"] = measured["podium_probability_error"].abs()
+    measured["position_error"] = measured["expected_position"] - measured["actual_position"]
+    measured["absolute_position_error"] = measured["position_error"].abs()
+
+    summary = {
+        "winner_top1_correct": int(
+            measured.loc[measured["win_probability"].idxmax(), "actual_winner"] == 1
+        ),
+        "win_probability_brier": float(np.mean(measured["win_probability_error"] ** 2)),
+        "podium_probability_brier": float(np.mean(measured["podium_probability_error"] ** 2)),
+        "position_mae": float(measured["absolute_position_error"].mean()),
+        "position_mean_signed_error": float(measured["position_error"].mean()),
+        "driver_count": int(len(measured)),
+    }
+    return measured, summary
+
+
+def _train_models(feature_path: Path, training_features=None):
+    """Train the three models, optionally using an ephemeral holdout-free feature file."""
+    if training_features is None:
+        training_path = feature_path
+        return (
+            train_and_save_winner_models(training_path),
+            train_and_save_podium_model(training_path),
+            train_and_save_position_model(training_path),
+        )
+
+    with tempfile.TemporaryDirectory(prefix="backtest_training_", dir=PROCESSED_DATA_DIR) as directory:
+        training_path = Path(directory) / feature_path.name
+        training_features.to_parquet(training_path, index=False)
+        return (
+            train_and_save_winner_models(training_path),
+            train_and_save_podium_model(training_path),
+            train_and_save_position_model(training_path),
+        )
+
+
 def run_pipeline(
         session: str,
         year: int,
         event: str,
+        measure_variation: bool = False,
 ):
     """Collect history and generate predictions for one requested event session."""
     logger.info("================================================================")
@@ -129,6 +231,11 @@ def run_pipeline(
     target_event_df = _select_target_event(
         df_features, year, target_round, resolved_event_name, session
     )
+    training_features = None
+    if measure_variation:
+        training_features, target_event_df = _prepare_backtest_data(
+            df_features, year, target_round, resolved_event_name, session
+        )
 
     # 2. Validation & Quality Checks
     session_code, _ = SESSION_TYPES[session]
@@ -137,9 +244,9 @@ def run_pipeline(
 
     # 3. Model Training & Evaluation
     logger.info(f"--- Training {session.title()}, Podium, and Position Models ---")
-    winner_artifacts = train_and_save_winner_models(feature_path)
-    podium_artifacts = train_and_save_podium_model(feature_path)
-    position_artifacts = train_and_save_position_model(feature_path)
+    winner_artifacts, podium_artifacts, position_artifacts = _train_models(
+        feature_path, training_features
+    )
 
     # 4. Generate Predictions for the Target Event
     logger.info("--- Generating Predictions ---")
@@ -169,11 +276,35 @@ def run_pipeline(
         "Abbreviation", "DriverName", "TeamName", "win_probability", "podium_probability", "expected_position"
     ]].sort_values("win_probability", ascending=False).reset_index(drop=True)
 
+    variation_summary = None
+    if measure_variation:
+        predictions_df, variation_summary = _measure_prediction_variation(
+            predictions_df, target_event_df
+        )
+
+    generated_at = pd.Timestamp.now(tz="UTC")
+    run_metadata = {
+        "session": session,
+        "year": year,
+        "round_number": target_round,
+        "event_name": resolved_event_name,
+        "prediction_generated_at_utc": generated_at,
+        "variation_measured": measure_variation,
+    }
+    for column, value in run_metadata.items():
+        predictions_df[column] = value
+
     # Save predictions
     PREDICTIONS_DATA_DIR.mkdir(parents=True, exist_ok=True)
     pred_save_path = PREDICTIONS_DATA_DIR / f"predictions_{session}_{year}_rnd{target_round}.parquet"
-    predictions_df.to_parquet(pred_save_path)
+    predictions_df.to_parquet(pred_save_path, index=False)
     logger.info(f"Predictions saved to {pred_save_path}")
+
+    if variation_summary is not None:
+        variation_path = PREDICTIONS_DATA_DIR / f"variation_{session}_{year}_rnd{target_round}.parquet"
+        variation_row = {**run_metadata, **variation_summary}
+        pd.DataFrame([variation_row]).to_parquet(variation_path, index=False)
+        logger.info(f"Backtest variation saved to {variation_path}")
 
     print("\n=======================================================")
     print(f"🏆 {year} {resolved_event_name.upper()} {session.upper()} PREDICTIONS")
@@ -188,8 +319,22 @@ def run_pipeline(
         sim_results = sim.simulate(
             predictions_df,
             scenario=scenario,
-            win_probabilities=predictions_df["win_probability"].values,
+            win_probabilities=predictions_df["win_probability"].to_numpy(dtype=float),
         )
+        simulation_metadata = {
+            "session": session,
+            "year": year,
+            "round_number": target_round,
+            "event_name": resolved_event_name,
+            "scenario": scenario,
+            "simulation_count": n_simulations,
+            "prediction_generated_at_utc": generated_at,
+        }
+        for column, value in simulation_metadata.items():
+            sim_results[column] = value
+        simulation_path = PREDICTIONS_DATA_DIR / f"simulation_{session}_{year}_rnd{target_round}.parquet"
+        sim_results.to_parquet(simulation_path, index=False)
+        logger.info(f"Simulation results saved to {simulation_path}")
         print(f"\n🎲 Monte Carlo Scenario: {scenario} ({n_simulations:,} Iterations):")
         print(
             sim_results[[
@@ -205,11 +350,18 @@ def main(argv=None):
     parser.add_argument("session", choices=SESSION_TYPES, help="target session type")
     parser.add_argument("year", type=int, help="target season (2021 or later)")
     parser.add_argument("event", help="target round name, such as 'Brazilian Grand Prix'")
+    parser.add_argument(
+        "--measure-variation",
+        action="store_true",
+        help="backtest a completed event, excluding it from model training and saving prediction errors",
+    )
     args = parser.parse_args(argv)
 
     if args.year < HISTORICAL_START_YEAR:
         parser.error(f"year must be {HISTORICAL_START_YEAR} or later")
-    run_pipeline(args.session, args.year, args.event)
+    run_pipeline(
+        args.session, args.year, args.event, measure_variation=args.measure_variation
+    )
 
 
 if __name__ == "__main__":

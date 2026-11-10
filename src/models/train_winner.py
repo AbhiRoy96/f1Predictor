@@ -19,6 +19,25 @@ from src.utils.config import MODELS_DIR, NON_FEATURE_COLUMNS, PROCESSED_DATA_DIR
 from src.utils.logging import setup_logger
 
 logger = setup_logger(__name__)
+DEFAULT_ENSEMBLE_WEIGHTS = [0.2, 0.3, 0.5]
+BACKTEST_MODEL_NAMES = ("LogisticRegression", "RandomForest", "XGBoost")
+
+
+def derive_ensemble_weights(backtest_results: Dict[str, Dict[str, Any]]) -> List[float]:
+    """Convert chronological grouped log losses to normalized inverse-loss weights."""
+    losses = []
+    for model_name in BACKTEST_MODEL_NAMES:
+        try:
+            loss = float(backtest_results[model_name]["mean_grouped_log_loss"])
+        except (KeyError, TypeError, ValueError):
+            return DEFAULT_ENSEMBLE_WEIGHTS.copy()
+        if not np.isfinite(loss) or loss <= 0:
+            return DEFAULT_ENSEMBLE_WEIGHTS.copy()
+        losses.append(loss)
+
+    inverse_losses = 1.0 / np.asarray(losses, dtype=float)
+    weights = inverse_losses / inverse_losses.sum()
+    return weights.tolist()
 
 
 def extract_features_and_target(
@@ -74,7 +93,7 @@ class EnsembleRaceWinnerModel:
     """Calibrated weighted ensemble combining Logistic Regression, Random Forest, and XGBoost."""
 
     def __init__(self, weights: Optional[List[float]] = None):
-        self.weights = weights or [0.2, 0.3, 0.5]
+        self.weights = list(weights) if weights is not None else DEFAULT_ENSEMBLE_WEIGHTS.copy()
         self.models = {
             "lr": CalibratedRacePredictor(create_logistic_regression_pipeline()),
             "rf": CalibratedRacePredictor(create_random_forest_pipeline()),
@@ -135,7 +154,6 @@ def train_and_save_winner_models(
     output_dir: Path = MODELS_DIR,
 ) -> Dict[str, Any]:
     """Train winner prediction models, perform backtesting, and serialize the best ensemble."""
-    from typing import Any
     path = race_features_path or (PROCESSED_DATA_DIR / "race_features.parquet")
 
     if not path.exists():
@@ -163,7 +181,8 @@ def train_and_save_winner_models(
 
     # 2. Fit full ensemble on all training data
     logger.info("Training full Calibrated Ensemble on all historical data...")
-    ensemble = EnsembleRaceWinnerModel()
+    ensemble_weights = derive_ensemble_weights(backtest_results)
+    ensemble = EnsembleRaceWinnerModel(weights=ensemble_weights)
     ensemble.fit(X, y, groups=groups)
 
     # Compute overall training metrics
@@ -179,6 +198,7 @@ def train_and_save_winner_models(
             "feature_columns": feature_cols,
             "train_metrics": train_metrics,
             "backtest_results": backtest_results,
+            "ensemble_weights": ensemble_weights,
         },
         model_save_path,
     )
@@ -189,6 +209,7 @@ def train_and_save_winner_models(
         "feature_columns": feature_cols,
         "train_metrics": train_metrics,
         "backtest_results": backtest_results,
+        "ensemble_weights": ensemble_weights,
     }
 
 

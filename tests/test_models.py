@@ -15,9 +15,11 @@ from src.models.evaluate import (
     compute_podium_metrics,
     compute_position_metrics,
     compute_winner_metrics,
-    run_chronological_backtest,
 )
-from src.models.train_winner import create_logistic_regression_pipeline, create_random_forest_pipeline, create_xgboost_pipeline, EnsembleRaceWinnerModel
+from src.models.train_winner import (
+    create_logistic_regression_pipeline,
+    derive_ensemble_weights,
+)
 
 
 class TestBaselinesAndModels(unittest.TestCase):
@@ -96,6 +98,24 @@ class TestBaselinesAndModels(unittest.TestCase):
         metrics = compute_position_metrics(y_true, y_pred)
         self.assertLess(metrics["position_mae"], 0.5)
         self.assertGreater(metrics["spearman_rank_correlation"], 0.9)
+
+    def test_backtest_log_loss_tunes_ensemble_weights(self):
+        backtest = {
+            "LogisticRegression": {"mean_grouped_log_loss": 2.0},
+            "RandomForest": {"mean_grouped_log_loss": 1.0},
+            "XGBoost": {"mean_grouped_log_loss": 0.5},
+        }
+
+        weights = derive_ensemble_weights(backtest)
+
+        self.assertAlmostEqual(sum(weights), 1.0)
+        self.assertGreater(weights[2], weights[1])
+        self.assertGreater(weights[1], weights[0])
+
+    def test_invalid_backtest_log_loss_uses_default_weights(self):
+        backtest = {"LogisticRegression": {"mean_grouped_log_loss": float("nan")}}
+
+        self.assertEqual(derive_ensemble_weights(backtest), [0.2, 0.3, 0.5])
 
 
 if __name__ == "__main__":
