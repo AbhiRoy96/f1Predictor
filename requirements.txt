@@ -1,0 +1,16 @@
+﻿fastf1
+pandas
+numpy
+polars
+scikit-learn
+xgboost
+shap
+matplotlib
+seaborn
+plotly
+streamlit
+mlflow
+joblib
+jupyter
+pyarrow
+requests
