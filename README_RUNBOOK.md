@@ -62,8 +62,9 @@ Useful options are `--stage`, `--skip-collection`, `--model-path`, `--strength-m
 
 ## Dynamic Bayesian experiment
 
-On this branch, CLI commands default to `--strength-model bayesian`.
-Use `--strength-model legacy` to retain the original XGBoost/logistic model.
+On this branch, CLI commands default to `--strength-model ensemble`.
+Use `--strength-model bayesian` for the standalone Bayesian challenger, or
+`--strength-model legacy` to retain the original XGBoost/logistic model.
 Python APIs retain their legacy default for compatibility.
 
 ```powershell
@@ -105,6 +106,44 @@ No accuracy improvement is assumed. Compare both variants on identical later
 held-out races before selecting one. Existing grid-baseline and limited-sample
 calibration cautions still apply. More simulations reduce numerical noise, not
 model misspecification. NumPy/SciPy supply the inference without new dependencies.
+
+## Bayesian and XGBoost ensemble
+
+The ensemble combines the dynamic Bayesian strength with the existing
+conditional-finisher XGBoost ranker, not with a second winner classifier.
+Each component's training-race centered root-mean-square score defines its
+normalization scale. Every OOF fold fits its own scales exclusively on its
+training data. The held-out field is centered but never used to estimate scales.
+Constant training scores use unit normalization with an explicit warning.
+
+For normalized strengths `b` and `x`, the combined strength is
+`w * b + (1 - w) * x`. A bounded search, including both pure-component
+endpoints, chooses `w` against past-only OOF final win and podium log loss
+at unit temperature, using 512 simulations per race and repeatable seeds.
+One final temperature is then fitted on the blended OOF simulation distribution
+with 1,024 simulations per race. The outer walk-forward test races do not
+participate in normalization, weight selection or calibration.
+
+Bayesian covariance is divided by its training scale squared and multiplied
+by `w` squared, preserving constructor/driver correlations in the blended
+simulator and saved-prediction replay. XGBoost is treated as a point estimate.
+With no OOF races, the prior weight is 0.5 and temperature remains 1.0; this is
+explicitly marked in provenance. Small calibration samples still generate warnings.
+
+```powershell
+python main.py train race 2026 "Brazilian Grand Prix" --strength-model ensemble --skip-collection
+python main.py predict race 2026 "Brazilian Grand Prix" --strength-model ensemble --skip-collection
+python main.py evaluate race 2026 "Brazilian Grand Prix" --strength-model ensemble --skip-collection
+python main.py evaluate race 2026 "Brazilian Grand Prix" --strength-model bayesian --skip-collection
+python main.py evaluate race 2026 "Brazilian Grand Prix" --strength-model legacy --skip-collection
+```
+
+Artifacts identify `race_bayesian_xgb_v1` and save component order, fitted
+scales, weights and their OOF provenance. Ensemble outputs include `_ensemble`
+in filenames and use variant-specific model fingerprints. Replay requires
+neither refitting models nor treating final probabilities as latent scores.
+No new dependency is required, and no accuracy gain is asserted until these
+variants are compared on untouched historical races.
 
 ## Bounded historical collection
 

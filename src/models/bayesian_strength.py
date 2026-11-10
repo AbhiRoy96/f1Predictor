@@ -199,4 +199,10 @@ class DynamicBayesianStrength:
         scores = design @ self.mean_
         groups = frame.Year.astype(str) + "_" + frame.RoundNumber.astype(str)
         centered = scores - pd.Series(scores).groupby(groups.to_numpy()).transform("mean").to_numpy()
-        return max(float(np.sqrt(np.mean(centered**2))), 1e-6)
+        scale = float(np.sqrt(np.mean(centered**2)))
+        if not np.isfinite(scale):
+            raise ValueError("Bayesian training scores must be finite")
+        if scale < 1e-6:
+            logger.warning("Constant Bayesian training scores; using unit ensemble normalization.")
+            return 1.0
+        return scale

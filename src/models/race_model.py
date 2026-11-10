@@ -22,9 +22,10 @@ from src.utils.logging import setup_logger
 
 logger = setup_logger(__name__)
 MODEL_VERSION = "race_pl_v2"
-STRENGTH_MODELS = ("legacy", "bayesian")
-DEFAULT_STRENGTH_MODEL = "bayesian"
-MODEL_VERSIONS = {"legacy": MODEL_VERSION, "bayesian": "race_bayesian_laplace_v1"}
+STRENGTH_MODELS = ("legacy", "bayesian", "ensemble")
+DEFAULT_STRENGTH_MODEL = "ensemble"
+MODEL_VERSIONS = {"legacy": MODEL_VERSION, "bayesian": "race_bayesian_laplace_v1",
+                  "ensemble": "race_bayesian_xgb_v1"}
 LOGIT_FEATURES = ["grid_position", "quali_position", "quali_gap_to_pole_pct",
                   "driver_race_form_5", "driver_race_era_strength_position",
                   "driver_race_season_avg_position", "driver_race_season_points_per_start",
@@ -187,15 +188,26 @@ class RacePredictor:
         self.strength_model = strength_model
 
     def _fit_strength(self, df, races):
-        if self.strength_model == "bayesian":
+        if self.strength_model in {"bayesian", "ensemble"}:
             from src.models.bayesian_strength import DynamicBayesianStrength
 
             context = [c for c in LOGIT_FEATURES + ["fp2_long_run_pace_rank", "fp_best_lap_gap_pct",
                                                    "fp_teammate_gap_pct"] if c in self.feature_columns_]
-            return DynamicBayesianStrength().fit(df, context)
+            bayesian = DynamicBayesianStrength().fit(df, context)
+            if self.strength_model == "bayesian":
+                return bayesian
+            from src.models.strength_ensemble import (
+                BayesianXGBComponents,
+                training_score_scale,
+            )
+
+            xgb = self._fit_legacy_strength(df, races, include_logistic=False)
+            return BayesianXGBComponents(
+                bayesian, xgb, bayesian.training_scale(df),
+                training_score_scale(self._scores(df, xgb)[:, 0], df))
         return self._fit_legacy_strength(df, races)
 
-    def _fit_legacy_strength(self, df, races):
+    def _fit_legacy_strength(self, df, races, include_logistic=True):
         neutral_position = float(np.median([len(rows) + 1 for rows in races]) / 2)
         imputer = NeutralRaceImputer(neutral_position)
         features = df.reindex(columns=self.feature_columns_).replace([np.inf, -np.inf], np.nan)
@@ -217,6 +229,8 @@ class RacePredictor:
         else:
             ranker = None
             logger.warning("No races with two eligible finishers; ranking strengths remain neutral.")
+        if not include_logistic:
+            return imputer, ranker, [], None
         lean = [c for c in LOGIT_FEATURES if c in self.feature_columns_]
         if not lean:
             lean = self.feature_columns_[:8]
@@ -240,7 +254,19 @@ class RacePredictor:
         return np.column_stack([rank_scores, logit_scores])
 
     def _strength_distribution(self, df, components):
+        if self.strength_model == "ensemble":
+            from src.models.strength_ensemble import blend_distribution
+
+            scores, covariance = self._ensemble_scores(df, components)
+            return blend_distribution(scores, covariance, self.blend_weights_[0])
         return components.posterior(df)
+
+    def _ensemble_scores(self, df, components):
+        mean, covariance = components.bayesian.posterior(df)
+        tree_scores = self._scores(df, components.xgb)[:, 0]
+        tree_scores = (tree_scores - tree_scores.mean()) / components.xgb_scale
+        scores = np.column_stack([mean / components.bayesian_scale, tree_scores])
+        return scores, covariance / components.bayesian_scale**2
 
     def fit(self, df):
         if df.empty or "target_position" not in df:
@@ -279,6 +305,10 @@ class RacePredictor:
                 if self.strength_model == "legacy":
                     oof_scores.append(self._scores(valid, components))
                     oof_covariances.append(None)
+                elif self.strength_model == "ensemble":
+                    scores, covariance = self._ensemble_scores(valid, components)
+                    oof_scores.append(scores)
+                    oof_covariances.append(covariance)
                 else:
                     mean, covariance = self._strength_distribution(valid, components)
                     oof_scores.append(np.column_stack([mean, np.zeros(len(valid))]))
@@ -292,6 +322,11 @@ class RacePredictor:
                           "validation_groups": [race_groups(ordered.iloc[races[i]]).iloc[0] for i in block],
                           "train_max_utc": str(train.SessionStartUtc.max()) if "SessionStartUtc" in train else None,
                           "validation_min_utc": str(ordered.iloc[races[block[0]]].SessionStartUtc.min()) if "SessionStartUtc" in ordered else None})
+            if self.strength_model == "ensemble":
+                folds[-1]["component_scales"] = {
+                    "bayesian": components.bayesian_scale, "xgb": components.xgb_scale,
+                    "source": "training_race_centered_rms",
+                }
         conditional = [np.flatnonzero(~dnf_labels(frame)[0].eq(1).to_numpy()) for frame in oof_frames]
         self.blend_weights_ = np.array([0.5, 0.5] if self.strength_model == "legacy" else [1.0, 0.0])
         if oof_scores and self.strength_model == "legacy":
@@ -306,11 +341,22 @@ class RacePredictor:
                 return float(np.mean(losses)) if losses else 0.0
             weight = float(minimize_scalar(loss, bounds=(0, 1), method="bounded").x)
             self.blend_weights_ = np.array([weight, 1 - weight])
+        if self.strength_model == "ensemble":
+            from src.models.strength_ensemble import fit_ensemble_weight
+
+            examples = [
+                {"frame": frame, "component_scores": scores, "strength_covariance": covariance,
+                 "p_dnf": risk, "race_correlation": correlation}
+                for frame, scores, covariance, risk, correlation in
+                zip(oof_frames, oof_scores, oof_covariances, oof_risks, oof_correlations)]
+            weight = fit_ensemble_weight(examples, seed=self.random_seed)
+            self.blend_weights_ = np.array([weight, 1 - weight])
         blended = [scores @ self.blend_weights_ for scores in oof_scores]
         self.temperature_ = 1.0
         self.calibration_examples_ = [
             {"frame": frame, "strength": strength, "p_dnf": risk, "race_correlation": correlation,
-             "strength_covariance": covariance}
+             "strength_covariance": (covariance * self.blend_weights_[0]**2
+                                     if self.strength_model == "ensemble" else covariance)}
             for frame, strength, risk, correlation, covariance in
             zip(oof_frames, blended, oof_risks, oof_correlations, oof_covariances)]
         self.pl_temperature_ = fit_simulation_temperature(self.calibration_examples_, seed=self.random_seed)
@@ -351,6 +397,17 @@ class RacePredictor:
                 "limitations": "fixed_prior_and_process_scales; approximate_gaussian_posterior; "
                                "driver_constructor_not_causal; constant_retirement_hazards; finishers_precede_retirees",
             })
+        if self.strength_model == "ensemble":
+            self.calibration_provenance_.update({
+                "weights_source": "oof_final_simulation" if blended else "fixed_equal_prior",
+                "weight_objective": "final_win_plus_podium_log_loss_at_unit_temperature",
+                "weight_simulations": 512,
+                "score_scaling": "per_component_training_race_centered_rms",
+            })
+            self.metadata_["component_scales"] = {
+                "bayesian": self.components_.bayesian_scale, "xgb": self.components_.xgb_scale}
+            self.metadata_["component_order"] = ["bayesian", "xgb"]
+            self.metadata_["limitations"] += "; ensemble_weight_and_xgb_parameter_uncertainty_not_integrated"
         return self
 
     def predict(self, df, n_simulations=20000, scenario="standard_dry", seed=42):

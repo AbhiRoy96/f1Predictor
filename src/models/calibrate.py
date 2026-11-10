@@ -10,14 +10,39 @@ from scipy.special import logsumexp
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 
 
+def simulation_log_loss(examples, temperature=1.0, n_simulations=1024, seed=42):
+    """Score final simulated win/podium probabilities, including latent uncertainty."""
+    from src.simulation.race_simulator import MonteCarloRaceSimulator, session_scenario
+
+    if not examples:
+        raise ValueError("Simulation scoring requires at least one held-out race")
+    values = []
+    for i, example in enumerate(examples):
+        frame = example["frame"].reset_index(drop=True)
+        grid = frame.copy()
+        grid["Abbreviation"] = np.arange(len(frame))
+        posterior = ({"strength_covariance": example["strength_covariance"]}
+                     if example.get("strength_covariance") is not None else {})
+        prediction = MonteCarloRaceSimulator(n_simulations, seed + i).simulate(
+            grid, session_scenario(frame), strength=example["strength"],
+            p_dnf=example["p_dnf"], pl_temperature=temperature,
+            race_correlation=example.get("race_correlation", 0.0), **posterior)
+        prediction = prediction.set_index("Abbreviation").reindex(np.arange(len(frame)))
+        position = frame.target_position.to_numpy(float)
+        winner = int(position.argmin())
+        p = np.clip(prediction.podium_probability.to_numpy(), 1e-12, 1 - 1e-12)
+        podium = position <= min(3, len(frame))
+        values.append(-np.log(np.clip(prediction.win_probability.iloc[winner], 1e-12, 1))
+                      - np.mean(podium * np.log(p) + (~podium) * np.log1p(-p)))
+    return float(np.mean(values))
+
+
 def fit_simulation_temperature(examples, default=1.0, n_simulations=1024, seed=42):
     """Fit one scale against final OOF win and podium probabilities.
 
     Each example supplies past-only strength/risk predictions and a complete
     held-out race. Common random numbers make candidate comparisons repeatable.
     """
-    from src.simulation.race_simulator import MonteCarloRaceSimulator, session_scenario
-
     if not examples:
         return float(default)
     cache = {}
@@ -25,25 +50,7 @@ def fit_simulation_temperature(examples, default=1.0, n_simulations=1024, seed=4
     def loss(temperature):
         key = float(temperature)
         if key not in cache:
-            values = []
-            for i, example in enumerate(examples):
-                frame = example["frame"].reset_index(drop=True)
-                grid = frame.copy()
-                grid["Abbreviation"] = np.arange(len(frame))
-                posterior = ({"strength_covariance": example["strength_covariance"]}
-                             if example.get("strength_covariance") is not None else {})
-                prediction = MonteCarloRaceSimulator(n_simulations, seed + i).simulate(
-                    grid, session_scenario(frame), strength=example["strength"],
-                    p_dnf=example["p_dnf"], pl_temperature=key,
-                    race_correlation=example.get("race_correlation", 0.0), **posterior)
-                prediction = prediction.set_index("Abbreviation").reindex(np.arange(len(frame)))
-                position = frame.target_position.to_numpy(float)
-                winner = int(position.argmin())
-                p = np.clip(prediction.podium_probability.to_numpy(), 1e-12, 1 - 1e-12)
-                podium = position <= min(3, len(frame))
-                values.append(-np.log(np.clip(prediction.win_probability.iloc[winner], 1e-12, 1))
-                              - np.mean(podium * np.log(p) + (~podium) * np.log1p(-p)))
-            cache[key] = float(np.mean(values))
+            cache[key] = simulation_log_loss(examples, key, n_simulations=n_simulations, seed=seed)
         return cache[key]
 
     candidates = np.unique(np.r_[np.geomspace(.3, 5, 7), default])
