@@ -11,6 +11,5 @@ plotly
 streamlit
 mlflow
 joblib
-jupyter
 pyarrow
 requests
