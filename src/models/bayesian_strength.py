@@ -159,8 +159,19 @@ class DynamicBayesianStrength:
                 def hessian(theta: np.ndarray, design=design, precision=precision) -> np.ndarray:
                     return precision + design.T @ pl_derivatives(design @ theta)[2] @ design
 
-                result = minimize(objective, prior_mean, jac=True, hess=hessian, method="Newton-CG",
-                                  options={"xtol": 1e-7, "maxiter": 100})
+                result = minimize(objective, prior_mean, jac=True, hess=hessian, method="trust-ncg",
+                                  options={"gtol": 1e-6, "maxiter": 100})
+                if not result.success and np.isfinite(result.x).all():
+                    _, final_grad = objective(result.x)
+                    if np.linalg.norm(final_grad) <= 1e-4:
+                        result.success = True
+                if not result.success or not np.isfinite(result.x).all():
+                    result = minimize(objective, prior_mean, jac=True, hess=hessian, method="Newton-CG",
+                                      options={"xtol": 1e-5, "maxiter": 100})
+                    if not result.success and np.isfinite(result.x).all():
+                        _, final_grad = objective(result.x)
+                        if np.linalg.norm(final_grad) <= 1e-4:
+                            result.success = True
                 if not result.success or not np.isfinite(result.x).all():
                     raise RuntimeError(f"Bayesian Laplace update failed at {start}: {result.message}")
                 self.mean_ = result.x

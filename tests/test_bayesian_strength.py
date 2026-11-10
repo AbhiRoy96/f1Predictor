@@ -124,6 +124,16 @@ class BayesianStrengthTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "covariance"):
                 simulate_race(mean, no_risk, strength_covariance=invalid)
 
+    def test_laplace_update_numerical_stability_with_multiple_contexts(self):
+        for seed in range(5):
+            np.random.seed(seed)
+            frame = race_fixture(12)
+            train = frame.loc[frame.RoundNumber.lt(12)].reset_index(drop=True)
+            model = DynamicBayesianStrength().fit(train, ["grid_position", "driver_race_season_avg_position"])
+            self.assertEqual(model.n_updates_, 11)
+            self.assertTrue(np.isfinite(model.mean_).all())
+            self.assertTrue(np.isfinite(model.covariance_).all())
+
 
 class BayesianIntegrationTests(unittest.TestCase):
     @classmethod
