@@ -39,6 +39,15 @@ METADATA_COLUMNS = [
     "Abbreviation",
     "DriverNumber",
     "TeamName",
+    "DriverName",
+    "team_lineage",
+    "stage",
+    "FeatureCutoffUtc",
+    "history_source_max_utc",
+    "weekend_source_max_utc",
+    "weekend_source_session_types",
+    "news_source_max_utc",
+    "grid_source_max_utc",
 ]
 
 TARGET_COLUMNS = [
@@ -47,9 +56,18 @@ TARGET_COLUMNS = [
     "target_winner",
     "target_podium",
     "target_pole",
+    "target_dnf",
+    "target_dnf_mechanical",
+    "target_dnf_collision",
 ]
 
 NON_FEATURE_COLUMNS = set(METADATA_COLUMNS + TARGET_COLUMNS + ["Position", "Points", "GridPosition"])
+
+
+def get_feature_columns(frame):
+    """Numeric model inputs only; all labels and provenance are excluded."""
+    return [column for column in frame.select_dtypes(include=["number", "bool"]).columns
+            if column not in NON_FEATURE_COLUMNS and not column.startswith("target_")]
 
 # Weather columns
 WEATHER_COLUMNS = [
@@ -78,6 +96,9 @@ CONSTRUCTOR_COLORS = {
     "Racing Point": "#F596C8",
     "Renault": "#FFF500",
     "Toro Rosso": "#469BFF",
+    "Racing Bulls": "#6692FF",
+    "Audi": "#F50537",
+    "Cadillac": "#AAAAAA",
 }
 
 DEFAULT_COLOR = "#E10600"  # F1 Red

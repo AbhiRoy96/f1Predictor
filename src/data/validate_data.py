@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Tuple
 import pandas as pd
-from src.utils.config import METADATA_COLUMNS, TARGET_COLUMNS
+from src.utils.config import NON_FEATURE_COLUMNS
 from src.utils.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -51,16 +51,91 @@ def validate_features_df(df: pd.DataFrame, session_type: str = "R") -> Tuple[boo
 
     # Check point-in-time timestamp integrity
     if "SessionStartUtc" in df.columns:
-        null_starts = df["SessionStartUtc"].isna().sum()
+        null_starts = len(df.loc[df["SessionStartUtc"].isna()])
         if null_starts > 0:
             errors.append(f"Found {null_starts} rows with missing SessionStartUtc")
 
     # Check that there is at most one winner per race for classified races
     if "target_winner" in df.columns and all(c in df.columns for c in ["Year", "RoundNumber"]):
         winners_per_race = df.groupby(["Year", "RoundNumber"])["target_winner"].sum()
-        multi_winners = (winners_per_race > 1).sum()
+        multi_winners = len(winners_per_race.loc[winners_per_race > 1])
         if multi_winners > 0:
             errors.append(f"Found {multi_winners} races with multiple target winners")
+
+    for column in df.columns:
+        if column not in NON_FEATURE_COLUMNS and not column.startswith("target_"):
+            if not pd.api.types.is_numeric_dtype(df[column]):
+                errors.append(f"Non-numeric model feature: {column}")
+            elif ("avg_position" in column or "_form_" in column) and not column.endswith("_is_missing"):
+                if (pd.to_numeric(df[column], errors="coerce") <= 0).any():
+                    errors.append(f"Nonpositive position feature: {column}")
+
+    if "stage" in df.columns:
+        if not df["stage"].isin(["pre_weekend", "post_fp", "post_quali"]).all():
+            errors.append("Unknown feature stage")
+        if "FeatureCutoffUtc" not in df.columns:
+            errors.append("Stage features require FeatureCutoffUtc")
+        elif "SessionStartUtc" in df.columns:
+            cutoff = pd.to_datetime(df["FeatureCutoffUtc"], utc=True, errors="coerce")
+            start = pd.to_datetime(df["SessionStartUtc"], utc=True, errors="coerce")
+            if (cutoff.isna() | cutoff.gt(start)).any():
+                errors.append("Invalid stage cutoff")
+            for column in ("history_source_max_utc", "weekend_source_max_utc", "grid_source_max_utc", "news_source_max_utc"):
+                if column not in df.columns:
+                    errors.append(f"Missing stage provenance: {column}")
+                    continue
+                source = pd.to_datetime(df[column], utc=True, errors="coerce")
+                if (df[column].notna() & source.isna()).any():
+                    errors.append(f"Invalid source timestamp: {column}")
+                if (source.notna() & source.ge(cutoff)).any():
+                    errors.append(f"Point-in-time violation: {column} must precede cutoff")
+            if "weekend_source_session_types" in df.columns:
+                for stage, types in zip(df["stage"], df["weekend_source_session_types"].fillna("")):
+                    sessions = set(filter(None, str(types).split(",")))
+                    if stage == "pre_weekend" and sessions:
+                        errors.append("pre_weekend contains weekend session sources")
+                        break
+                    if stage == "post_fp" and not sessions.issubset({"FP1", "FP2", "FP3"}):
+                        errors.append("post_fp contains non-practice session sources")
+                        break
+            for column in ("grid_position", "quali_position", "quali_gap_to_pole_pct", "quali_gap_to_teammate_pct",
+                           "grid_penalty_places", "pit_lane_start"):
+                if column not in df.columns:
+                    continue
+                present = df[column].notna()
+                flag = column + "_is_missing"
+                if flag in df.columns:
+                    present &= df[flag].eq(0)
+                if (present & df["stage"].ne("post_quali")).any():
+                    errors.append(f"Stage-ineligible qualifying/grid feature: {column}")
+            weekend_columns = [column for column in df.columns if isinstance(column, str) and column.startswith("prior_weekend_")
+                               and not column.endswith("_is_missing")]
+            weekend_columns += [column for column in ("fp_best_lap_gap_pct", "fp2_long_run_pace_rank", "fp_teammate_gap_pct") if column in df]
+            for column in weekend_columns:
+                present = df[column].notna()
+                if column + "_is_missing" in df.columns:
+                    present &= df[column + "_is_missing"].eq(0)
+                if (present & df["stage"].eq("pre_weekend")).any():
+                    errors.append(f"Stage-ineligible weekend feature: {column}")
+            provenance = {
+                "grid_source_max_utc": ["grid_position", "pit_lane_start"],
+                "weekend_source_max_utc": weekend_columns + ["quali_position", "quali_gap_to_pole_pct", "quali_gap_to_teammate_pct"],
+                "news_source_max_utc": ["prior_news_item_count"],
+            }
+            for source_column, columns in provenance.items():
+                if source_column not in df.columns:
+                    continue
+                for column in columns:
+                    if column not in df.columns:
+                        continue
+                    present = df[column].notna()
+                    if column + "_is_missing" in df.columns:
+                        present &= df[column + "_is_missing"].eq(0)
+                    # A zero news count legitimately has no latest publication.
+                    if column == "prior_news_item_count":
+                        present &= df[column].gt(0)
+                    if (present & df[source_column].isna()).any():
+                        errors.append(f"Missing provenance for populated feature: {column}")
 
     return len(errors) == 0, errors
 

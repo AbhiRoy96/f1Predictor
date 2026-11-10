@@ -15,7 +15,7 @@ from xgboost import XGBClassifier
 
 from src.models.calibrate import CalibratedRacePredictor
 from src.models.evaluate import compute_winner_metrics, run_chronological_backtest
-from src.utils.config import MODELS_DIR, NON_FEATURE_COLUMNS, PROCESSED_DATA_DIR, RANDOM_SEED
+from src.utils.config import MODELS_DIR, PROCESSED_DATA_DIR, RANDOM_SEED, get_feature_columns
 from src.utils.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -45,10 +45,7 @@ def extract_features_and_target(
     target_col: str = "target_winner",
 ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
     """Extract numeric feature matrix X, target series y, and feature column names."""
-    feature_cols = [
-        col for col in df.columns
-        if col not in NON_FEATURE_COLUMNS and pd.api.types.is_numeric_dtype(df[col])
-    ]
+    feature_cols = get_feature_columns(df)
     if not feature_cols:
         raise ValueError("No numeric feature columns found in dataset")
 

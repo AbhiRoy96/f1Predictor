@@ -26,7 +26,7 @@ def _softmax_by_group(scores: pd.Series, group_keys: pd.Series, temperature: flo
 class PolePositionBaseline(BaseEstimator, ClassifierMixin):
     """Predicts winner strictly based on qualifying / grid position."""
 
-    def __init__(self, position_col: str = "driver_qualifying_season_avg_position"):
+    def __init__(self, position_col: str = "grid_position"):
         self.position_col = position_col
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None):
@@ -37,7 +37,7 @@ class PolePositionBaseline(BaseEstimator, ClassifierMixin):
         col = self.position_col if self.position_col in X.columns else None
         if col is None:
             # Fallback to any available position indicator
-            for candidate in ["driver_qualifying_season_avg_position", "driver_race_season_avg_position"]:
+            for candidate in ["GridPosition", "driver_qualifying_season_avg_position", "driver_race_season_avg_position"]:
                 if candidate in X.columns:
                     col = candidate
                     break

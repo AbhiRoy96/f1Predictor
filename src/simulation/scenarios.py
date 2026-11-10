@@ -17,6 +17,21 @@ class RaceScenario:
     pace_variance_scale: float = 1.0
     overtaking_difficulty: float = 0.5  # 0.0 = very easy, 1.0 = monaco-like hard
     tyre_deg_multiplier: float = 1.0
+    pl_temperature: float = 1.0
+    team_sigma: float = 0.0
+
+    def __post_init__(self):
+        from math import isfinite
+
+        for field in ["safety_car_probability", "vsc_probability", "weather_rain_probability",
+                      "dnf_base_rate", "overtaking_difficulty"]:
+            if not 0 <= getattr(self, field) <= 1:
+                raise ValueError(f"{field} must lie in [0, 1]")
+        for field in ["pace_variance_scale", "tyre_deg_multiplier", "pl_temperature"]:
+            if not isfinite(getattr(self, field)) or getattr(self, field) <= 0:
+                raise ValueError(f"{field} must be finite and positive")
+        if not isfinite(self.team_sigma) or self.team_sigma < 0:
+            raise ValueError("team_sigma must be finite and nonnegative")
 
 
 SCENARIOS: Dict[str, RaceScenario] = {

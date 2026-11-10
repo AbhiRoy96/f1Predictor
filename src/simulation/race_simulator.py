@@ -1,141 +1,131 @@
-"""Monte Carlo race simulation engine for scenario analysis and uncertainty modeling."""
+"""Vectorized Plackett-Luce finishing orders, including retired drivers."""
 
-import argparse
-from typing import Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
+
 from src.simulation.scenarios import RaceScenario, get_scenario
 from src.utils.config import RANDOM_SEED
-from src.utils.logging import setup_logger
 
-logger = setup_logger(__name__)
+
+def simulate_race(strength, p_dnf, n_sims=20000, pl_temperature=1.0,
+                  team_idx=None, team_sigma=0.0, seed=42):
+    """Return (places, retired), both shaped (simulations, drivers)."""
+    strength = np.asarray(strength, dtype=float)
+    p_dnf = np.asarray(p_dnf, dtype=float)
+    if strength.ndim != 1 or p_dnf.shape != strength.shape:
+        raise ValueError("strength and p_dnf must be equally sized vectors")
+    if not np.isfinite(strength).all() or not np.isfinite(p_dnf).all():
+        raise ValueError("Simulation inputs must be finite")
+    if np.any((p_dnf < 0) | (p_dnf > 1)):
+        raise ValueError("DNF probabilities must lie in [0, 1]")
+    if not isinstance(n_sims, (int, np.integer)) or n_sims <= 0:
+        raise ValueError("n_sims must be a positive integer")
+    if not np.isfinite(pl_temperature) or pl_temperature <= 0 or not np.isfinite(team_sigma) or team_sigma < 0:
+        raise ValueError("Temperature must be positive and team_sigma nonnegative")
+    rng = np.random.default_rng(seed)
+    n = len(strength)
+    util = strength / pl_temperature + rng.gumbel(size=(n_sims, n))
+    if team_idx is not None and team_sigma > 0 and n:
+        team_idx = np.asarray(team_idx)
+        if team_idx.shape != strength.shape or np.any(team_idx < 0):
+            raise ValueError("team_idx must contain one nonnegative team index per driver")
+        _, team_idx = np.unique(team_idx, return_inverse=True)
+        util += rng.normal(0, team_sigma, size=(n_sims, team_idx.max() + 1))[:, team_idx]
+    retired = rng.random((n_sims, n)) < p_dnf
+    # Lexicographic sorting keeps even extreme strengths behind all finishers.
+    retirement_order = rng.random((n_sims, n))
+    order = np.lexsort((np.where(retired, retirement_order, -util), retired), axis=1)
+    pos = np.empty_like(order)
+    np.put_along_axis(pos, order, np.broadcast_to(np.arange(1, n + 1), order.shape), axis=1)
+    return pos, retired
+
+
+def summarize_positions(positions, retired):
+    """Coherent unconditional probabilities; no rounding or dropped retirements."""
+    n = positions.shape[1]
+    result = pd.DataFrame({
+        "win_probability": (positions == 1).mean(axis=0),
+        "podium_probability": (positions <= min(3, n)).mean(axis=0),
+        "top10_probability": (positions <= min(10, n)).mean(axis=0),
+        "dnf_probability": retired.mean(axis=0),
+        "expected_position": positions.mean(axis=0),
+        "median_position": np.median(positions, axis=0),
+        "p10_position": np.percentile(positions, 10, axis=0),
+        "p90_position": np.percentile(positions, 90, axis=0),
+    })
+    for position in range(1, n + 1):
+        result[f"prob_p{position}"] = (positions == position).mean(axis=0)
+    return result
 
 
 class MonteCarloRaceSimulator:
-    """Simulates Grand Prix outcomes using stochastic race dynamics and scenario modifiers."""
+    """Scenario wrapper; legacy win-probability inputs are interpreted as PL weights."""
 
-    def __init__(self, n_simulations: int = 2000, random_seed: int = RANDOM_SEED):
+    def __init__(self, n_simulations=2000, random_seed=RANDOM_SEED):
+        if not isinstance(n_simulations, (int, np.integer)) or n_simulations < 1:
+            raise ValueError("n_simulations must be a positive integer")
         self.n_simulations = n_simulations
         self.random_seed = random_seed
 
-    def simulate(
-        self,
-        drivers_df: pd.DataFrame,
-        scenario: Union[str, RaceScenario] = "standard_dry",
-        win_probabilities: Optional[np.ndarray] = None,
-    ) -> pd.DataFrame:
-        """Run Monte Carlo simulation for a grid of drivers.
-
-        drivers_df must contain:
-        - Abbreviation (or Driver)
-        - TeamName
-        Optional:
-        - driver_qualifying_season_avg_position / grid_position
-        - driver_race_points_5
-        """
-        np.random.seed(self.random_seed)
+    def simulate(self, drivers_df, scenario="standard_dry", win_probabilities=None,
+                 strength=None, p_dnf=None, pl_temperature=1.0):
         sc = get_scenario(scenario) if isinstance(scenario, str) else scenario
-        n_drivers = len(drivers_df)
-        if n_drivers == 0:
+        if not isinstance(sc, RaceScenario):
+            raise TypeError("scenario must be a name or RaceScenario")
+        if drivers_df.empty:
             return pd.DataFrame()
-
-        drivers = drivers_df.copy().reset_index(drop=True)
-        driver_ids = drivers["Abbreviation"].values if "Abbreviation" in drivers.columns else drivers.index.values
-
-        # Base race pace capability (lower score = faster pace)
-        if win_probabilities is not None and len(win_probabilities) == n_drivers:
-            # Map high win probability to faster baseline pace
-            base_pace = -10.0 * np.log(np.clip(win_probabilities, 1e-4, 1.0))
-        elif "driver_qualifying_season_avg_position" in drivers.columns:
-            base_pace = drivers["driver_qualifying_season_avg_position"].fillna(12.0).values.astype(float)
+        drivers = drivers_df.reset_index(drop=True)
+        n = len(drivers)
+        if strength is None:
+            if win_probabilities is not None:
+                probabilities = np.asarray(win_probabilities, dtype=float)
+                if probabilities.shape != (n,) or not np.isfinite(probabilities).all() or np.any(probabilities < 0):
+                    raise ValueError("Invalid win probabilities")
+                strength = np.log(np.clip(probabilities, 1e-12, None))
+            else:
+                col = next((c for c in ["grid_position", "GridPosition", "driver_qualifying_season_avg_position"]
+                            if c in drivers), None)
+                strength = -drivers[col].fillna((n + 1) / 2).to_numpy(float) / 3 if col else np.zeros(n)
+        strength = np.asarray(strength, dtype=float).copy()
+        if strength.shape != (n,):
+            raise ValueError("One strength is required per driver")
+        rng = np.random.default_rng(self.random_seed)
+        # SC/VSC/rain change each simulated race, not just its overall scale.
+        rain = rng.random(self.n_simulations) < sc.weather_rain_probability
+        safety = rng.random(self.n_simulations) < sc.safety_car_probability
+        vsc = rng.random(self.n_simulations) < sc.vsc_probability
+        temperature = pl_temperature * sc.pl_temperature * sc.pace_variance_scale
+        temperature *= np.sqrt(sc.tyre_deg_multiplier)
+        grid_col = next((c for c in ["grid_position", "GridPosition"] if c in drivers), None)
+        if grid_col:
+            grid = drivers[grid_col].where(drivers[grid_col] > 0).fillna((n + 1) / 2).to_numpy(float)
+            strength -= (sc.overtaking_difficulty - 0.5) * (grid - grid.mean()) / 3
+        team_idx = pd.factorize(drivers.get("TeamName", pd.Series(np.arange(n))).fillna("Unknown"))[0]
+        if p_dnf is None:
+            risks = np.full(n, sc.dnf_base_rate)
         else:
-            base_pace = np.linspace(1.0, float(n_drivers), n_drivers)
-
-        win_counts = np.zeros(n_drivers, dtype=int)
-        podium_counts = np.zeros(n_drivers, dtype=int)
-        position_matrix = np.zeros((n_drivers, n_drivers), dtype=int)  # [driver, position]
-        dnf_counts = np.zeros(n_drivers, dtype=int)
-        finish_positions = [[] for _ in range(n_drivers)]
-
-        base_std = 2.0 * sc.pace_variance_scale
-
-        for sim in range(self.n_simulations):
-            # 1. Pace sampling
-            pace_noise = np.random.normal(0, base_std, n_drivers)
-            total_time = base_pace + pace_noise
-
-            # 2. Safety car intervention compression
-            if np.random.rand() < sc.safety_car_probability:
-                # SC compresses gaps by 50%
-                mean_time = np.mean(total_time)
-                total_time = mean_time + (total_time - mean_time) * 0.5
-
-            # 3. Mechanical & incident DNF sampling
-            dnf_mask = np.random.rand(n_drivers) < sc.dnf_base_rate
-            for i in range(n_drivers):
-                if dnf_mask[i]:
-                    dnf_counts[i] += 1
-                    total_time[i] = 1e9  # Retired
-
-            # 4. Finishing order calculation
-            finish_order = np.argsort(total_time)
-
-            for pos, driver_idx in enumerate(finish_order):
-                if not dnf_mask[driver_idx]:
-                    finish_positions[driver_idx].append(pos + 1)
-                    if pos < n_drivers:
-                        position_matrix[driver_idx, pos] += 1
-                    if pos == 0:
-                        win_counts[driver_idx] += 1
-                    if pos < 3:
-                        podium_counts[driver_idx] += 1
-
-        results = []
-        for i, driver_id in enumerate(driver_ids):
-            driver_row = drivers.iloc[i]
-            win_p = float(win_counts[i] / self.n_simulations)
-            podium_p = float(podium_counts[i] / self.n_simulations)
-            dnf_p = float(dnf_counts[i] / self.n_simulations)
-            avg_pos = float(np.mean(finish_positions[i])) if finish_positions[i] else float(n_drivers)
-
-            # Top 3 positions distribution
-            p1_p = float(position_matrix[i, 0] / self.n_simulations)
-            p2_p = float(position_matrix[i, 1] / self.n_simulations) if n_drivers > 1 else 0.0
-            p3_p = float(position_matrix[i, 2] / self.n_simulations) if n_drivers > 2 else 0.0
-
-            results.append({
-                "Abbreviation": driver_id,
-                "TeamName": driver_row.get("TeamName", "Unknown"),
-                "scenario": sc.name,
-                "simulated_win_prob": round(win_p, 4),
-                "simulated_podium_prob": round(podium_p, 4),
-                "simulated_dnf_prob": round(dnf_p, 4),
-                "expected_position": round(avg_pos, 2),
-                "prob_p1": round(p1_p, 4),
-                "prob_p2": round(p2_p, 4),
-                "prob_p3": round(p3_p, 4),
-            })
-
-        sim_df = pd.DataFrame(results).sort_values("simulated_win_prob", ascending=False).reset_index(drop=True)
-        return sim_df
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Monte Carlo F1 race simulation.")
-    parser.add_argument("--scenario", type=str, default="standard_dry", help="Scenario name")
-    parser.add_argument("--sims", type=int, default=2000, help="Number of simulations")
-    args = parser.parse_args()
-
-    # Quick demo grid
-    demo_grid = pd.DataFrame([
-        {"Abbreviation": "VER", "TeamName": "Red Bull Racing", "driver_qualifying_season_avg_position": 1.5},
-        {"Abbreviation": "NOR", "TeamName": "McLaren", "driver_qualifying_season_avg_position": 2.2},
-        {"Abbreviation": "LEC", "TeamName": "Ferrari", "driver_qualifying_season_avg_position": 3.0},
-        {"Abbreviation": "HAM", "TeamName": "Ferrari", "driver_qualifying_season_avg_position": 4.5},
-        {"Abbreviation": "PIA", "TeamName": "McLaren", "driver_qualifying_season_avg_position": 4.8},
-        {"Abbreviation": "RUS", "TeamName": "Mercedes", "driver_qualifying_season_avg_position": 5.2},
-    ])
-
-    sim = MonteCarloRaceSimulator(n_simulations=args.sims)
-    out = sim.simulate(demo_grid, scenario=args.scenario)
-    print(out.to_string(index=False))
+            risks = np.asarray(p_dnf, dtype=float)
+            if risks.shape != (n,) or not np.isfinite(risks).all() or np.any((risks < 0) | (risks > 1)):
+                raise ValueError("Invalid DNF probabilities")
+            # Standard dry preserves the learned probabilities exactly.
+            risks = np.clip(risks * sc.dnf_base_rate / 0.05, 0, 1)
+        # Sample in a few vectorized strata to retain race-level scenario shocks.
+        codes = rain.astype(int) * 4 + safety.astype(int) * 2 + vsc.astype(int)
+        positions = np.empty((self.n_simulations, n), dtype=int)
+        retired = np.empty_like(positions, dtype=bool)
+        for code in np.unique(codes):
+            mask = codes == code
+            scale = 1 + 0.8 * bool(code & 4) + 0.35 * bool(code & 2) + 0.12 * bool(code & 1)
+            positions[mask], retired[mask] = simulate_race(
+                strength, np.clip(risks * (1 + 0.4 * bool(code & 4)), 0, 1),
+                int(mask.sum()), temperature * scale, team_idx,
+                sc.team_sigma * sc.tyre_deg_multiplier, int(rng.integers(0, 2**32)))
+        result = summarize_positions(positions, retired)
+        result["Abbreviation"] = drivers.get("Abbreviation", drivers.get("Driver", pd.Series(np.arange(n))))
+        result["TeamName"] = drivers.get("TeamName", "Unknown")
+        result["scenario"] = scenario if isinstance(scenario, str) else sc.name
+        for target, source in [("simulated_win_prob", "win_probability"),
+                               ("simulated_podium_prob", "podium_probability"),
+                               ("simulated_dnf_prob", "dnf_probability")]:
+            result[target] = result[source]
+        return result.sort_values("simulated_win_prob", ascending=False, kind="stable").reset_index(drop=True)

@@ -1,10 +1,41 @@
 """Probability calibration and race-level distribution reconciliation."""
 
-from typing import Optional, Union
+from typing import Optional
+import re
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
-from sklearn.base import BaseEstimator, ClassifierMixin
+from scipy.optimize import minimize_scalar
+from scipy.special import logsumexp
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
+
+
+def fit_temperature(scores_by_race, winner_idx_by_race, default=1.0):
+    """Fit only caller-supplied held-out scores; one winner per race."""
+    if not scores_by_race:
+        return float(default)
+
+    def loss(temperature):
+        return np.mean([logsumexp(np.asarray(s) / temperature) - np.asarray(s)[w] / temperature
+                        for s, w in zip(scores_by_race, winner_idx_by_race)])
+
+    return float(minimize_scalar(loss, bounds=(0.3, 5.0), method="bounded").x)
+
+
+def pl_nll(scores, finish_order, temperature=1.0):
+    """Negative PL log likelihood of the supplied (possibly finisher-only) order."""
+    ordered = np.asarray(scores, dtype=float)[np.asarray(finish_order, dtype=int)] / temperature
+    if not len(ordered):
+        return 0.0
+    return float((np.logaddexp.accumulate(ordered[::-1])[::-1] - ordered).sum())
+
+
+def fit_pl_temperature(scores_by_race, orders, default=1.0):
+    usable = [(s, order) for s, order in zip(scores_by_race, orders) if len(order) > 1]
+    if not usable:
+        return float(default)
+    return float(minimize_scalar(
+        lambda temperature: np.mean([pl_nll(s, order, temperature) for s, order in usable]),
+        bounds=(0.3, 5.0), method="bounded").x)
 
 
 def normalize_race_probabilities(
@@ -42,34 +73,43 @@ class CalibratedRacePredictor(BaseEstimator, ClassifierMixin):
         self.fitted_temperature_ = temperature
 
     def fit(self, X: pd.DataFrame, y: pd.Series, groups: Optional[pd.Series] = None):
-        """Fit the base estimator and optionally learn optimal temperature on validation set."""
-        self.base_estimator.fit(X, y)
+        """Expanding race OOF calibration, then refit the estimator on all rows.
 
+        Year_round group keys are ordered numerically; other keys must be supplied
+        in chronological first-occurrence order.
+        With fewer than three races no temperature is learned.
+        """
+        self.fitted_temperature_ = self.temperature
+        self.calibration_provenance_ = {"method": "expanding_race_oof", "folds": [], "n_races": 0}
+        scores, winners = [], []
         if groups is not None and self.method == "temperature":
-            # Learn optimal temperature scaling using log-loss on training/val predictions
-            raw_scores = self._get_raw_scores(X)
-
-            def loss_func(temp):
-                t = max(temp[0], 0.05)
-                # Compute softmax per group
-                df = pd.DataFrame({"score": raw_scores / t, "group": groups.values, "y": y.values})
-                total_loss = 0.0
-                count = 0
-                for _, grp in df.groupby("group"):
-                    sc = grp["score"].values - np.max(grp["score"].values)
-                    exp_sc = np.exp(sc)
-                    p = exp_sc / np.sum(exp_sc)
-                    p = np.clip(p, 1e-7, 1.0 - 1e-7)
-                    y_true = grp["y"].values
-                    total_loss -= np.sum(y_true * np.log(p))
-                    count += 1
-                return total_loss / max(count, 1)
-
-            res = minimize(loss_func, [1.0], bounds=[(0.05, 10.0)], method="L-BFGS-B")
-            self.fitted_temperature_ = float(res.x[0])
-        else:
-            self.fitted_temperature_ = self.temperature
-
+            group_values = np.asarray(groups)
+            labels = pd.unique(group_values)
+            if all(re.fullmatch(r"\d+(?:\.0)?_\d+(?:\.0)?", str(label)) for label in labels):
+                labels = np.asarray(sorted(labels, key=lambda label: tuple(float(part) for part in str(label).split("_"))))
+            starts = np.array_split(np.arange(max(2, len(labels) // 3), len(labels)), 4)
+            for block in starts:
+                if not len(block):
+                    continue
+                train = np.flatnonzero(np.isin(group_values, labels[:block[0]]))
+                valid = np.flatnonzero(np.isin(group_values, labels[block]))
+                if len(np.unique(np.asarray(y)[train])) < 2:
+                    continue
+                estimator = clone(self.base_estimator)
+                estimator.fit(X.iloc[train], np.asarray(y)[train])
+                wrapper = CalibratedRacePredictor(estimator)
+                raw = wrapper._get_raw_scores(X.iloc[valid])
+                for label in labels[block]:
+                    mask = group_values[valid] == label
+                    truth = np.asarray(y)[valid][mask]
+                    if truth.sum() == 1:
+                        scores.append(raw[mask])
+                        winners.append(int(truth.argmax()))
+                self.calibration_provenance_["folds"].append({
+                    "train_groups": labels[:block[0]].tolist(), "validation_groups": labels[block].tolist()})
+            self.fitted_temperature_ = fit_temperature(scores, winners, self.temperature)
+        self.calibration_provenance_["n_races"] = len(scores)
+        self.base_estimator.fit(X, y)
         return self
 
     def _get_raw_scores(self, X: pd.DataFrame) -> np.ndarray:

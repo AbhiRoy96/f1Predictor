@@ -1,367 +1,467 @@
-"""F1 Race Intelligence & Prediction Pipeline Orchestrator."""
+"""Point-in-time F1 collection, training, prediction and evaluation commands."""
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+
+import fastf1
 import joblib
 import numpy as np
 import pandas as pd
 
 from src.data.collect_driver_constructor_stats import collect_driver_constructor_stats
-from src.data.collect_season import _resolve_event, collect_event
+from src.data.collect_season import _resolve_event, _session_specs, collect_event
 from src.data.normalise_entities import normalise_driver_name
 from src.data.validate_data import validate_features_df
 from src.features.engineer_features import build_features, load_results
-from src.models.train_podium import train_and_save_podium_model
-from src.models.train_position import train_and_save_position_model
-from src.models.train_winner import train_and_save_winner_models
-from src.simulation.race_simulator import MonteCarloRaceSimulator
-from src.utils.config import (
-    PREDICTIONS_DATA_DIR,
-    PROCESSED_DATA_DIR,
-    RAW_DATA_DIR,
-)
+from src.utils.config import PREDICTIONS_DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
 from src.utils.logging import setup_logger
 
 logger = setup_logger("f1_orchestrator")
 HISTORICAL_START_YEAR = 2021
-SESSION_TYPES = {
-    "race": ("R", "race"),
-    "sprint": ("S", "sprint"),
-    "qualifying": ("Q", "qualifying"),
-}
+MODELS_DIR = Path("models")
+REPORTS_DIR = Path("reports")
+STAGES = ("pre_weekend", "post_fp", "post_quali")
+SESSION_TYPES = {"race": ("R", "race"), "sprint": ("S", "sprint"),
+                 "qualifying": ("Q", "qualifying")}
+
+
+def _missing_sessions(year, event, now=None):
+    """Return elapsed sessions without persisted results (or practice laps)."""
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.to_datetime(now, utc=True)
+    missing = set()
+    for _, code, start in _session_specs(event):
+        if pd.isna(start) or start > now:
+            continue
+        suffixes = ("results", "laps") if code.startswith("FP") else ("results",)
+        present = False
+        for suffix in suffixes:
+            path = RAW_DATA_DIR / f"{year}_{code.lower()}_{suffix}.parquet"
+            if not path.exists():
+                continue
+            frame = pd.read_parquet(path, columns=["RoundNumber"])
+            if "RoundNumber" in frame:
+                rows = frame.loc[pd.to_numeric(frame["RoundNumber"], errors="coerce").eq(
+                    int(event["RoundNumber"]))]
+                if not rows.empty:
+                    present = True
+                    break
+        if not present:
+            missing.add(code)
+    return missing
 
 
 def collect_historical_data(year: int, event: str) -> None:
-    """Collect the requested event for each season from 2021 through the target year."""
+    """Incrementally collect full past calendars and this season through the target."""
     if year < HISTORICAL_START_YEAR:
         raise ValueError(f"Target year must be {HISTORICAL_START_YEAR} or later.")
-
-    target_years = range(HISTORICAL_START_YEAR, year + 1)
-    logger.info(f"Collecting event '{event}' for seasons {HISTORICAL_START_YEAR}-{year}")
-
-    for collection_year in target_years:
-        try:
-            logger.info(f"Collecting event '{event}' for season {collection_year}...")
-            collect_event(collection_year, event, raise_on_failure=False)
-        except Exception as exc:
-            logger.warning(f"Error collecting event '{event}' for season {collection_year}: {exc}")
-
-    logger.info("Extracting and updating driver/constructor reference tables...")
-    collect_driver_constructor_stats()
-    logger.info("Data collection finished successfully.")
-
-
-def ensure_processed_data(session: str, year: int, event: str) -> Path:
-    """Collect history and build a point-in-time table for the requested session."""
-    if session not in SESSION_TYPES:
-        raise ValueError(f"Unsupported session {session!r}; choose race, sprint, or qualifying.")
-    if year < HISTORICAL_START_YEAR:
-        raise ValueError(f"Target year must be {HISTORICAL_START_YEAR} or later.")
-
-    session_code, feature_name = SESSION_TYPES[session]
-    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    collect_historical_data(year, event)
+    failures = []
+    for collection_year in range(HISTORICAL_START_YEAR, year + 1):
+        try:
+            schedule = fastf1.get_event_schedule(collection_year, include_testing=False)
+            schedule = schedule.loc[pd.to_numeric(schedule["RoundNumber"], errors="coerce").gt(0)]
+            schedule.assign(Year=collection_year).to_parquet(
+                RAW_DATA_DIR / f"{collection_year}_schedule.parquet", index=False)
+            limit = int(_resolve_event(schedule, year, event)["RoundNumber"]) if collection_year == year else None
+            for _, scheduled_event in schedule.sort_values("RoundNumber").iterrows():
+                if limit is not None and int(scheduled_event["RoundNumber"]) > limit:
+                    continue
+                missing = _missing_sessions(collection_year, scheduled_event)
+                if not missing:
+                    continue
+                try:
+                    collect_event(collection_year, scheduled_event["EventName"],
+                                  event=scheduled_event, raise_on_failure=True,
+                                  session_types=missing)
+                    still_missing = _missing_sessions(collection_year, scheduled_event)
+                    if still_missing:
+                        failures.append(f"{collection_year} {scheduled_event['EventName']}: {sorted(still_missing)}")
+                except Exception as exc:
+                    failures.append(f"{collection_year} {scheduled_event['EventName']}: {exc}")
+        except Exception as exc:
+            failures.append(f"{collection_year} schedule: {exc}")
+    collect_driver_constructor_stats()
+    if failures:
+        raise RuntimeError("Historical collection incomplete; retry missing sessions: " + "; ".join(failures))
+    logger.info("Historical collection complete; saved rounds cover calendars through the target.")
 
-    logger.info(f"Building point-in-time {session} features from collected results...")
+
+def _data_hash(paths, context=""):
+    digest = hashlib.sha256(context.encode())
+    for path in sorted(paths, key=str):
+        digest.update(str(path).encode())
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def _load_feature_inputs():
+    inputs = {}
+    for key in ("laps", "weather", "messages"):
+        frames = [pd.read_parquet(path) for path in sorted(RAW_DATA_DIR.glob(f"*_{key}.parquet"))]
+        inputs[key] = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    news_paths = list(RAW_DATA_DIR.glob("*news*.parquet"))
+    inputs["news"] = (pd.concat([pd.read_parquet(path) for path in news_paths], ignore_index=True)
+                      if news_paths else pd.DataFrame())
+    news_csv = RAW_DATA_DIR / "news.csv"
+    if news_csv.exists():
+        inputs["news"] = pd.concat([inputs["news"], pd.read_csv(news_csv)], ignore_index=True)
+    return inputs
+
+
+def _add_scheduled_target(results, session, year, event):
+    """Use confirmed weekend entrants and scheduled starts, never invented outcomes."""
+    path = RAW_DATA_DIR / f"{year}_schedule.parquet"
+    if not path.exists():
+        return results
+    scheduled = _resolve_event(pd.read_parquet(path), year, event)
+    code = SESSION_TYPES[session][0]
+    this_event = (pd.to_numeric(results.Year, errors="coerce").eq(year)
+                  & pd.to_numeric(results.RoundNumber, errors="coerce").eq(int(scheduled.RoundNumber)))
+    if (this_event & results.SessionType.eq(code)).any():
+        return results
+    starts = [start for _, kind, start in _session_specs(scheduled) if kind == code and pd.notna(start)]
+    if not starts:
+        raise RuntimeError(f"No scheduled start for {event} {session}.")
+    start = starts[0]
+    entrants = results.loc[this_event & (pd.to_datetime(results.SessionStartUtc, utc=True) < start)]
+    if entrants.empty:
+        raise RuntimeError(f"No confirmed weekend entry list for {event}; collect entrants before predicting.")
+    # Reserve/practice-only drivers are not confirmed race entrants. Prefer Q/SQ or S.
+    confirmed = entrants.loc[entrants.SessionType.isin(["Q", "SQ", "S"])]
+    if confirmed.empty:
+        raise RuntimeError(f"No confirmed qualifying/sprint entrants for {event}; supply a verified entry list.")
+    confirmed = confirmed.loc[confirmed.SessionStartUtc.eq(confirmed.SessionStartUtc.max())]
+    latest = confirmed.sort_values("SessionStartUtc").drop_duplicates("Abbreviation", keep="last").copy()
+    latest["SessionType"] = code
+    latest["SessionStartUtc"] = start
+    for column in ("Position", "Points", "Status", "ClassifiedPosition", "GridPosition", "GridPublishedAt",
+                   "Q1", "Q2", "Q3"):
+        if column in latest:
+            latest[column] = pd.NaT if column == "GridPublishedAt" else np.nan
+    return pd.concat([results, latest], ignore_index=True, sort=False)
+
+
+def ensure_processed_data(session: str, year: int, event: str, stage="post_quali",
+                          skip_collection=False) -> Path:
+    """Build or reuse a source-content-addressed staged feature table."""
+    if session not in SESSION_TYPES or stage not in STAGES:
+        raise ValueError("Unsupported session or prediction stage.")
+    if year < HISTORICAL_START_YEAR:
+        raise ValueError(f"Target year must be {HISTORICAL_START_YEAR} or later.")
+    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not skip_collection:
+        collect_historical_data(year, event)
+    session_code, feature_name = SESSION_TYPES[session]
+    source_paths = list(RAW_DATA_DIR.glob("*.parquet"))
+    source_paths.extend(RAW_DATA_DIR.glob("*news*.csv"))
+    source_paths.extend([Path("src/features/engineer_features.py"),
+                         Path("src/data/normalise_entities.py"), Path("src/utils/config.py"), Path("main.py")])
+    fingerprint = _data_hash(source_paths, f"{session}:{year}:{event}:{stage}")
+    feature_path = PROCESSED_DATA_DIR / f"{feature_name}_{stage}_features.parquet"
+    hash_path = feature_path.with_suffix(".sha256")
+    if feature_path.exists() and hash_path.exists() and hash_path.read_text() == fingerprint:
+        return feature_path
     results = load_results()
     result_years = pd.to_numeric(results["Year"], errors="coerce")
-    historical_results = results.loc[
-        result_years.between(HISTORICAL_START_YEAR, year)
-    ].copy()
-    features = build_features(historical_results)
+    historical_results = results.loc[result_years.between(HISTORICAL_START_YEAR, year)].copy()
+    historical_results = _add_scheduled_target(historical_results, session, year, event)
+    features = build_features(historical_results, stage=stage, **_load_feature_inputs())
     session_features = features.get(session_code)
     if session_features is None or session_features.empty:
-        raise RuntimeError(
-            f"No {session} results found for seasons {HISTORICAL_START_YEAR}-{year}."
-        )
-
-    feature_path = PROCESSED_DATA_DIR / f"{feature_name}_features.parquet"
+        raise RuntimeError(f"No {session} features available for {HISTORICAL_START_YEAR}-{year}.")
     session_features.to_parquet(feature_path, index=False)
-    logger.info(f"Saved {len(session_features)} {session} feature rows to {feature_path}")
+    # Keep the canonical filename available to existing analysis pages.
+    session_features.to_parquet(PROCESSED_DATA_DIR / f"{feature_name}_features.parquet", index=False)
+    hash_path.write_text(fingerprint)
     return feature_path
 
 
 def _resolve_target_event(year: int, event: str):
-    """Resolve an event alias to its canonical name and round from the saved schedule."""
-    schedule_path = RAW_DATA_DIR / f"{year}_schedule.parquet"
-    if not schedule_path.exists():
+    path = RAW_DATA_DIR / f"{year}_schedule.parquet"
+    if not path.exists():
         raise RuntimeError(f"No event schedule is available for {year}; unable to resolve {event!r}.")
-
-    schedule = pd.read_parquet(schedule_path)
     try:
-        event_row = _resolve_event(schedule, year, event)
+        row = _resolve_event(pd.read_parquet(path), year, event)
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
-    return int(event_row["RoundNumber"]), str(event_row["EventName"])
+    return int(row["RoundNumber"]), str(row["EventName"])
 
 
 def _select_target_event(features, year, round_number, event_name, session):
-    """Select only the requested event and session, failing instead of using a fallback."""
-    session_code, _ = SESSION_TYPES[session]
-    year_values = pd.to_numeric(features["Year"], errors="coerce")
-    round_values = pd.to_numeric(features["RoundNumber"], errors="coerce")
-    selected = features.loc[year_values.eq(year) & round_values.eq(round_number)].copy()
+    selected = features.loc[pd.to_numeric(features["Year"], errors="coerce").eq(year)
+                            & pd.to_numeric(features["RoundNumber"], errors="coerce").eq(round_number)].copy()
     if "SessionType" in selected:
-        selected = selected.loc[selected["SessionType"].eq(session_code)].copy()
+        selected = selected.loc[selected["SessionType"].eq(SESSION_TYPES[session][0])].copy()
     if selected.empty:
-        raise RuntimeError(
-            f"No {session} session data found for {event_name} in {year} (round {round_number})."
-        )
+        raise RuntimeError(f"No {session} session data found for {event_name} in {year} (round {round_number}).")
     return selected
 
 
-def _validate_completed_target_results(target_event_df: pd.DataFrame) -> None:
-    """Reject target sessions whose recorded outcomes are not complete enough to score."""
-    target_columns = ["target_winner", "target_podium", "target_position"]
-    missing_columns = [column for column in target_columns if column not in target_event_df]
-    if missing_columns:
-        raise ValueError(
-            "Variation measurement requires completed target results; missing "
-            f"columns: {', '.join(missing_columns)}."
-        )
-
-    targets = target_event_df[target_columns].apply(pd.to_numeric, errors="coerce")
+def _validate_completed_target_results(target_event_df):
+    columns = ["target_winner", "target_podium", "target_position"]
+    if any(column not in target_event_df for column in columns):
+        raise ValueError("Variation measurement requires completed target results; missing target columns.")
+    targets = target_event_df[columns].apply(pd.to_numeric, errors="coerce")
     if targets.isna().any().any() or not np.isfinite(targets.to_numpy()).all():
-        raise ValueError(
-            "Variation measurement requires completed target results; one or more "
-            "winner, podium, or finishing-position outcomes are missing."
-        )
-    if not targets["target_winner"].isin([0, 1]).all() or targets["target_winner"].sum() != 1:
+        raise ValueError("Variation measurement requires completed target results; missing outcomes.")
+    if not targets.target_winner.isin([0, 1]).all() or targets.target_winner.sum() != 1:
         raise ValueError("Variation measurement requires exactly one completed event winner.")
-    if not targets["target_podium"].isin([0, 1]).all():
-        raise ValueError("Variation measurement requires valid completed podium outcomes.")
-    if (targets["target_position"] <= 0).any():
-        raise ValueError("Variation measurement requires valid completed finishing positions.")
+    if not targets.target_podium.isin([0, 1]).all() or (targets.target_position <= 0).any():
+        raise ValueError("Variation measurement requires valid completed finishing positions and podium outcomes.")
+
+
+def _training_before(features, target):
+    if "SessionStartUtc" not in features:
+        raise ValueError("SessionStartUtc is required for chronological training.")
+    starts = pd.to_datetime(features["SessionStartUtc"], utc=True, errors="coerce")
+    target_starts = pd.to_datetime(target["SessionStartUtc"], utc=True, errors="coerce")
+    if target_starts.isna().any():
+        raise ValueError("Target session has no valid SessionStartUtc cutoff.")
+    training = features.loc[starts < target_starts.min()].copy()
+    training = training.loc[pd.to_numeric(training["target_position"], errors="coerce").gt(0)]
+    if training.empty or training["target_winner"].dropna().nunique() < 2:
+        raise ValueError("Not enough historical winner examples before the target session.")
+    return training
 
 
 def _prepare_backtest_data(features, year, round_number, event_name, session):
-    """Return training rows and a validated held-out event for leakage-safe scoring."""
     held_out = _select_target_event(features, year, round_number, event_name, session)
     _validate_completed_target_results(held_out)
-
-    year_values = pd.to_numeric(features["Year"], errors="coerce")
-    round_values = pd.to_numeric(features["RoundNumber"], errors="coerce")
-    target_mask = year_values.eq(year) & round_values.eq(round_number)
-    if "SessionType" in features:
-        session_code, _ = SESSION_TYPES[session]
-        target_mask &= features["SessionType"].eq(session_code)
-    training = features.loc[~target_mask].copy()
-
-    if training.empty:
-        raise ValueError("Not enough historical data remains to train after holding out the target event.")
-    if training["target_winner"].dropna().nunique() < 2:
-        raise ValueError("Not enough historical winner examples remain after holding out the target event.")
-    if training["target_podium"].dropna().nunique() < 2:
-        raise ValueError("Not enough historical podium examples remain after holding out the target event.")
-    if not (pd.to_numeric(training["target_position"], errors="coerce") > 0).any():
-        raise ValueError("Not enough historical finishing-position examples remain after the holdout.")
-    return training, held_out
+    return _training_before(features, held_out), held_out
 
 
-def _measure_prediction_variation(predictions: pd.DataFrame, actuals: pd.DataFrame):
-    """Join actual outcomes to held-out predictions and calculate event-level errors."""
-    outcome_columns = {
-        "target_winner": "actual_winner",
-        "target_podium": "actual_podium",
-        "target_position": "actual_position",
-    }
-    actual_results = actuals[["Abbreviation", *outcome_columns]].rename(columns=outcome_columns)
+def _measure_prediction_variation(predictions, actuals):
+    columns = {"target_winner": "actual_winner", "target_podium": "actual_podium",
+               "target_position": "actual_position"}
+    actual_results = actuals[["Abbreviation", *columns]].rename(columns=columns)
     measured = predictions.merge(actual_results, on="Abbreviation", how="left", validate="one_to_one")
-    if measured[list(outcome_columns.values())].isna().any().any():
+    if measured[list(columns.values())].isna().any().any():
         raise ValueError("Could not align all held-out predictions with their completed results.")
-
-    measured["win_probability_error"] = measured["win_probability"] - measured["actual_winner"]
-    measured["win_probability_absolute_error"] = measured["win_probability_error"].abs()
-    measured["podium_probability_error"] = measured["podium_probability"] - measured["actual_podium"]
-    measured["podium_probability_absolute_error"] = measured["podium_probability_error"].abs()
-    measured["position_error"] = measured["expected_position"] - measured["actual_position"]
-    measured["absolute_position_error"] = measured["position_error"].abs()
-
+    for probability, actual in (("win_probability", "actual_winner"), ("podium_probability", "actual_podium")):
+        measured[f"{probability}_error"] = measured[probability] - measured[actual]
+        measured[f"{probability}_absolute_error"] = measured[f"{probability}_error"].abs()
+    measured["position_error"] = measured.expected_position - measured.actual_position
+    measured["absolute_position_error"] = measured.position_error.abs()
     summary = {
-        "winner_top1_correct": int(
-            measured.loc[measured["win_probability"].idxmax(), "actual_winner"] == 1
-        ),
-        "win_probability_brier": float(np.mean(measured["win_probability_error"] ** 2)),
-        "podium_probability_brier": float(np.mean(measured["podium_probability_error"] ** 2)),
-        "position_mae": float(measured["absolute_position_error"].mean()),
-        "position_mean_signed_error": float(measured["position_error"].mean()),
-        "driver_count": int(len(measured)),
+        "winner_top1_correct": int(measured.loc[measured.win_probability.idxmax(), "actual_winner"] == 1),
+        "win_probability_brier": float((measured.win_probability_error ** 2).mean()),
+        "podium_probability_brier": float((measured.podium_probability_error ** 2).mean()),
+        "position_mae": float(measured.absolute_position_error.mean()),
+        "position_median_absolute_error": float(measured.absolute_position_error.median()),
+        "position_bias": float(measured.position_error.mean()),
     }
     return measured, summary
 
 
-def _train_models(feature_path: Path, training_features=None):
-    """Train the three models, optionally using an ephemeral holdout-free feature file."""
+def _training_hash(training):
+    values = training.sort_index(axis=1).astype(str)
+    data = pd.util.hash_pandas_object(values, index=False).to_numpy().tobytes()
+    paths = [*Path("src/models").glob("*.py"), *Path("src/simulation").glob("*.py"),
+             Path("src/utils/config.py")]
+    return _data_hash(paths, hashlib.sha256(data).hexdigest())
+
+
+def _train_models(feature_path, training_features=None, output_dir=None):
+    """Train a single race model; temporary artifacts never enter models/."""
+    from src.models.race_model import train_and_save_race_model
+
     if training_features is None:
-        training_path = feature_path
-        return (
-            train_and_save_winner_models(training_path),
-            train_and_save_podium_model(training_path),
-            train_and_save_position_model(training_path),
-        )
-
-    with tempfile.TemporaryDirectory(prefix="backtest_training_", dir=PROCESSED_DATA_DIR) as directory:
-        training_path = Path(directory) / feature_path.name
+        return train_and_save_race_model(feature_path, output_dir=output_dir)
+    with tempfile.TemporaryDirectory(prefix="backtest_", dir=PROCESSED_DATA_DIR) as directory:
+        temporary = Path(directory)
+        training_path = temporary / Path(feature_path).name
         training_features.to_parquet(training_path, index=False)
-        return (
-            train_and_save_winner_models(training_path),
-            train_and_save_podium_model(training_path),
-            train_and_save_position_model(training_path),
-        )
+        artifacts = train_and_save_race_model(training_path, output_dir=temporary)
+        # Load before the temporary directory is removed, with no production writes.
+        return joblib.load(artifacts["model_path"])
 
 
-def run_pipeline(
-        session: str,
-        year: int,
-        event: str,
-        measure_variation: bool = False,
-):
-    """Collect history and generate predictions for one requested event session."""
-    logger.info("================================================================")
-    logger.info("  FORMULA 1 RACE INTELLIGENCE & PREDICTION ENGINE")
-    logger.info("================================================================")
+def _model_artifact(feature_path, training, stage, session, action, model_path=None):
+    fingerprint = _training_hash(training)
+    if model_path is not None:
+        artifact = joblib.load(model_path)
+        metadata = artifact.get("metadata", {})
+        if metadata.get("training_hash") != fingerprint:
+            raise ValueError("Model data/code fingerprint differs from current chronological training data; retrain it.")
+        if metadata.get("stage") != stage or metadata.get("session") != session:
+            raise ValueError("Model stage/session does not match the requested forecast.")
+        return artifact
+    candidates = sorted(MODELS_DIR.glob("*/metadata.json"), reverse=True) if MODELS_DIR.exists() else []
+    if action != "train":
+        for path in candidates:
+            metadata = json.loads(path.read_text())
+            if (metadata.get("training_hash") == fingerprint and metadata.get("stage") == stage
+                    and metadata.get("session") == session):
+                model_file = path.parent / metadata["artifact_filename"]
+                if model_file.exists():
+                    return joblib.load(model_file)
+        if action == "predict":
+            raise RuntimeError("No matching trained model. Run the train command first or use the legacy automatic command.")
+    from src.models.race_model import train_and_save_race_model
 
-    if session not in SESSION_TYPES:
-        raise ValueError(f"Unsupported session {session!r}; choose race, sprint, or qualifying.")
-    feature_path = ensure_processed_data(session, year, event)
-    df_features = pd.read_parquet(feature_path)
-    target_round, resolved_event_name = _resolve_target_event(year, event)
-    target_event_df = _select_target_event(
-        df_features, year, target_round, resolved_event_name, session
-    )
-    training_features = None
+    run_id = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%S%fZ") + "_" + fingerprint[:8]
+    output_dir = MODELS_DIR / run_id
+    output_dir.mkdir(parents=True, exist_ok=False)
+    training_path = output_dir / "training_features.parquet"
+    training.to_parquet(training_path, index=False)
+    artifacts = train_and_save_race_model(training_path, output_dir=output_dir)
+    artifact = joblib.load(artifacts["model_path"])
+    try:
+        git_sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                                 text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        git_sha = "unknown"
+    metadata = dict(artifact.get("metadata", {}))
+    metadata.update({"model_version": run_id, "training_hash": fingerprint,
+                     "stage": stage, "session": session, "git_sha": git_sha,
+                     "training_start_utc": str(training.SessionStartUtc.min()),
+                     "training_end_utc": str(training.SessionStartUtc.max()),
+                     "training_races": int(training[["Year", "RoundNumber"]].drop_duplicates().shape[0]),
+                     "training_rows": len(training), "feature_columns": artifact.get("feature_columns", []),
+                     "artifact_filename": Path(artifacts["model_path"]).name})
+    artifact["metadata"] = metadata
+    joblib.dump(artifact, artifacts["model_path"])
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
+    return artifact
+
+
+def _print_predictions(predictions, session):
+    columns = ["Abbreviation", "DriverName", "TeamName", "win_probability", "podium_probability",
+               "top10_probability", "expected_position", "median_position", "p10_position",
+               "p90_position", "dnf_probability", "vs_grid_order"]
+    print("\n" + "=" * 70)
+    print(f"{session.upper()} PREDICTIONS")
+    print("=" * 70)
+    print(predictions[[column for column in columns if column in predictions]].to_string(index=False))
+    print("=" * 70)
+
+
+def _validate_prediction_probabilities(predictions):
+    columns = ["win_probability", "podium_probability", "top10_probability"]
+    probabilities = predictions[columns].to_numpy(dtype=float)
+    if (not len(predictions) or not np.isfinite(probabilities).all()
+            or (probabilities < 0).any() or (probabilities > 1).any()):
+        raise ValueError("Prediction probabilities must be finite values in [0, 1].")
+    totals = probabilities.sum(axis=0)
+    expected = [1, min(3, len(predictions)), min(10, len(predictions))]
+    if not np.allclose(totals, expected, rtol=0, atol=1e-9):
+        raise ValueError("Inconsistent win, podium or top-10 probability totals.")
+    if (np.diff(probabilities, axis=1) < -1e-12).any():
+        raise ValueError("Predictions must satisfy win <= podium <= top10.")
+
+
+def _evaluate(features, session, year, target_round, stage, seed=42):
+    from src.models.evaluate import run_race_walk_forward
+
+    result = run_race_walk_forward(features, seed=seed)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    prefix = f"walk_forward_{session}_{year}_rnd{target_round}_{stage}"
+    for name, value in result.items():
+        if isinstance(value, pd.DataFrame):
+            value.to_parquet(REPORTS_DIR / f"{prefix}_{name}.parquet", index=False)
+    for name in ("metrics", "baselines", "reliability"):
+        if name in result:
+            print(f"\n{name.upper()}\n{result[name].to_string(index=False)}")
+    return result
+
+
+def run_pipeline(session, year, event, measure_variation=False, *, stage="post_quali",
+                 skip_collection=False, action="auto", model_path=None, n_simulations=20000,
+                 seed=42, scenario="standard_dry"):
+    if n_simulations <= 0:
+        raise ValueError("n_simulations must be positive.")
+    feature_path = ensure_processed_data(session, year, event, stage, skip_collection)
+    features = pd.read_parquet(feature_path)
+    valid, errors = validate_features_df(features)
+    if not valid:
+        raise ValueError("Feature validation failed: " + "; ".join(errors))
+    target_round, event_name = _resolve_target_event(year, event)
+    target = _select_target_event(features, year, target_round, event_name, session)
+    if action == "evaluate":
+        cutoff = pd.to_datetime(target.SessionStartUtc, utc=True).min()
+        return _evaluate(features.loc[pd.to_datetime(features.SessionStartUtc, utc=True) <= cutoff],
+                         session, year, target_round, stage, seed)
     if measure_variation:
-        training_features, target_event_df = _prepare_backtest_data(
-            df_features, year, target_round, resolved_event_name, session
-        )
-
-    # 2. Validation & Quality Checks
-    session_code, _ = SESSION_TYPES[session]
-    is_valid, errors = validate_features_df(df_features, session_type=session_code)
-    logger.info(f"Data Contract Validation: {'PASSED' if is_valid else 'FAILED'} (Errors: {errors})")
-
-    # 3. Model Training & Evaluation
-    logger.info(f"--- Training {session.title()}, Podium, and Position Models ---")
-    winner_artifacts, podium_artifacts, position_artifacts = _train_models(
-        feature_path, training_features
-    )
-
-    # 4. Generate Predictions for the Target Event
-    logger.info("--- Generating Predictions ---")
-    model_obj = winner_artifacts["model_path"]
-    model_dict = pd.read_pickle(model_obj) if str(model_obj).endswith(".pkl") else joblib.load(model_obj)
-    winner_model = model_dict["model"]
-    feat_cols = model_dict["feature_columns"]
-
-    X_pred = target_event_df[feat_cols].fillna(0)
-    groups_pred = pd.Series(f"{year}_{target_round}", index=target_event_df.index)
-
-    win_probs = winner_model.predict_proba(X_pred, groups=groups_pred)[:, 1]
-    target_event_df["win_probability"] = np.round(win_probs, 4)
-
-    # Podium model prediction
-    podium_dict = joblib.load(podium_artifacts["model_path"])
-    podium_probs = podium_dict["model"].predict_proba(X_pred)[:, 1]
-    target_event_df["podium_probability"] = np.round(podium_probs, 4)
-
-    # Position model prediction
-    pos_dict = joblib.load(position_artifacts["model_path"])
-    exp_pos = pos_dict["model"].predict(X_pred)
-    target_event_df["expected_position"] = np.round(exp_pos, 2)
-
-    target_event_df["DriverName"] = target_event_df["Abbreviation"].apply(normalise_driver_name)
-    predictions_df = target_event_df[[
-        "Abbreviation", "DriverName", "TeamName", "win_probability", "podium_probability", "expected_position"
-    ]].sort_values("win_probability", ascending=False).reset_index(drop=True)
-
-    variation_summary = None
+        training, target = _prepare_backtest_data(features, year, target_round, event_name, session)
+        PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        artifact = _train_models(feature_path, training)
+    else:
+        training = _training_before(features, target)
+        artifact = _model_artifact(feature_path, training, stage, session, action, model_path)
+    if action == "train":
+        logger.info("Model trained: %s", artifact.get("metadata", {}).get("model_version"))
+        return artifact
+    predictions = artifact["model"].predict(target, n_simulations=n_simulations, scenario=scenario, seed=seed)
+    predictions = predictions.copy()
+    _validate_prediction_probabilities(predictions)
+    if "DriverName" not in predictions:
+        predictions["DriverName"] = predictions.Abbreviation.map(normalise_driver_name)
+    predictions = predictions.sort_values("win_probability", ascending=False).reset_index(drop=True)
+    if "grid_position" in target:
+        grids = target.set_index("Abbreviation").grid_position
+        predictions["vs_grid_order"] = predictions.Abbreviation.map(grids) - predictions.expected_position
+    metadata = artifact.get("metadata", {})
+    run_metadata = {"session": session, "year": year, "round_number": target_round,
+                    "event_name": event_name, "prediction_generated_at_utc": pd.Timestamp.now(tz="UTC"),
+                    "variation_measured": measure_variation, "stage": stage,
+                    "model_version": metadata.get("model_version", "held_out_" + _training_hash(training)[:12]),
+                    "training_start_utc": str(training.SessionStartUtc.min()),
+                    "training_end_utc": str(training.SessionStartUtc.max()),
+                    "training_races": len(training[["Year", "RoundNumber"]].drop_duplicates()),
+                    "scenario": scenario, "simulation_count": n_simulations, "seed": seed}
+    summary = None
     if measure_variation:
-        predictions_df, variation_summary = _measure_prediction_variation(
-            predictions_df, target_event_df
-        )
-
-    generated_at = pd.Timestamp.now(tz="UTC")
-    run_metadata = {
-        "session": session,
-        "year": year,
-        "round_number": target_round,
-        "event_name": resolved_event_name,
-        "prediction_generated_at_utc": generated_at,
-        "variation_measured": measure_variation,
-    }
-    for column, value in run_metadata.items():
-        predictions_df[column] = value
-
-    # Save predictions
+        predictions, summary = _measure_prediction_variation(predictions, target)
+    for name, value in run_metadata.items():
+        predictions[name] = value
     PREDICTIONS_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    pred_save_path = PREDICTIONS_DATA_DIR / f"predictions_{session}_{year}_rnd{target_round}.parquet"
-    predictions_df.to_parquet(pred_save_path, index=False)
-    logger.info(f"Predictions saved to {pred_save_path}")
-
-    if variation_summary is not None:
-        variation_path = PREDICTIONS_DATA_DIR / f"variation_{session}_{year}_rnd{target_round}.parquet"
-        variation_row = {**run_metadata, **variation_summary}
-        pd.DataFrame([variation_row]).to_parquet(variation_path, index=False)
-        logger.info(f"Backtest variation saved to {variation_path}")
-
-    print("\n=======================================================")
-    print(f"🏆 {year} {resolved_event_name.upper()} {session.upper()} PREDICTIONS")
-    print("=======================================================")
-    print(predictions_df.to_string(index=False))
-
-    if session in {"race", "sprint"}:
-        n_simulations = 2000
-        scenario = "standard_dry"
-        logger.info(f"\n--- Running Monte Carlo Scenario Simulation ({scenario}) ---")
-        sim = MonteCarloRaceSimulator(n_simulations=n_simulations)
-        sim_results = sim.simulate(
-            predictions_df,
-            scenario=scenario,
-            win_probabilities=predictions_df["win_probability"].to_numpy(dtype=float),
-        )
-        simulation_metadata = {
-            "session": session,
-            "year": year,
-            "round_number": target_round,
-            "event_name": resolved_event_name,
-            "scenario": scenario,
-            "simulation_count": n_simulations,
-            "prediction_generated_at_utc": generated_at,
-        }
-        for column, value in simulation_metadata.items():
-            sim_results[column] = value
-        simulation_path = PREDICTIONS_DATA_DIR / f"simulation_{session}_{year}_rnd{target_round}.parquet"
-        sim_results.to_parquet(simulation_path, index=False)
-        logger.info(f"Simulation results saved to {simulation_path}")
-        print(f"\n🎲 Monte Carlo Scenario: {scenario} ({n_simulations:,} Iterations):")
-        print(
-            sim_results[[
-                "Abbreviation", "TeamName", "simulated_win_prob", "simulated_podium_prob",
-                "simulated_dnf_prob", "expected_position",
-            ]].to_string(index=False)
-        )
-        print("=======================================================\n")
+    stem = f"{session}_{year}_rnd{target_round}"
+    predictions.to_parquet(PREDICTIONS_DATA_DIR / f"predictions_{stem}_{stage}.parquet", index=False)
+    predictions.to_parquet(PREDICTIONS_DATA_DIR / f"predictions_{stem}.parquet", index=False)
+    if summary is not None:
+        pd.DataFrame([{**run_metadata, **summary}]).to_parquet(
+            PREDICTIONS_DATA_DIR / f"variation_{stem}_{stage}.parquet", index=False)
+        pd.DataFrame([{**run_metadata, **summary}]).to_parquet(
+            PREDICTIONS_DATA_DIR / f"variation_{stem}.parquet", index=False)
+    _print_predictions(predictions, session)
+    if summary is not None:
+        print("\nHELD-OUT ERRORS (separate from predictions)\n" + pd.DataFrame([summary]).to_string(index=False))
+    print(f"\nDerived forecast: {scenario}; stage={stage}; samples={n_simulations:,}; seed={seed}")
+    return predictions
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Predict an F1 race, sprint, or qualifying session")
-    parser.add_argument("session", choices=SESSION_TYPES, help="target session type")
-    parser.add_argument("year", type=int, help="target season (2021 or later)")
-    parser.add_argument("event", help="target round name, such as 'Brazilian Grand Prix'")
-    parser.add_argument(
-        "--measure-variation",
-        action="store_true",
-        help="backtest a completed event, excluding it from model training and saving prediction errors",
-    )
-    args = parser.parse_args(argv)
-
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    action = arguments.pop(0) if arguments and arguments[0] in {"train", "predict", "evaluate"} else "auto"
+    parser = argparse.ArgumentParser(description="Train, predict or evaluate an F1 session")
+    parser.add_argument("session", choices=SESSION_TYPES)
+    parser.add_argument("year", type=int)
+    parser.add_argument("event")
+    parser.add_argument("--measure-variation", action="store_true", help="Chronologically backtest a completed event without writing models/")
+    parser.add_argument("--stage", choices=STAGES, default="post_quali")
+    parser.add_argument("--skip-collection", action="store_true")
+    parser.add_argument("--model-path", type=Path)
+    parser.add_argument("--n-simulations", type=int, default=20000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--scenario", default="standard_dry")
+    args = parser.parse_args(arguments)
     if args.year < HISTORICAL_START_YEAR:
         parser.error(f"year must be {HISTORICAL_START_YEAR} or later")
-    run_pipeline(
-        args.session, args.year, args.event, measure_variation=args.measure_variation
-    )
+    if args.n_simulations <= 0:
+        parser.error("--n-simulations must be positive")
+    if args.measure_variation and action in {"train", "evaluate"}:
+        parser.error("--measure-variation is only valid for prediction")
+    options = dict(stage=args.stage, skip_collection=args.skip_collection, action=action,
+                   model_path=args.model_path, n_simulations=args.n_simulations, seed=args.seed,
+                   scenario=args.scenario)
+    return run_pipeline(args.session, args.year, args.event, measure_variation=args.measure_variation, **options)
 
 
 if __name__ == "__main__":

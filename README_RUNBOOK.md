@@ -1,6 +1,6 @@
 # F1 Prediction Pipeline Runbook
 
-This guide covers running the prediction pipeline from the repository root. The command collects real FastF1 session data for the requested event, builds features from the 2021 season through the target year, trains the prediction models, and writes the requested session's predictions.
+This guide covers the point-in-time F1 pipeline. Collection is incremental across every round from 2021 through the target event; training, prediction and walk-forward evaluation are separate commands.
 
 ## Prerequisites
 
@@ -21,10 +21,13 @@ On subsequent runs, activate the environment first with `source .venv/bin/activa
 
 ## Run a prediction
 
-The CLI takes exactly three positional arguments: session type, target year, and event name.
+The legacy automatic command remains available, while explicit commands avoid retraining during prediction.
 
 ```text
 python main.py <race|sprint|qualifying> <year> "<event name>"
+python main.py train <race|sprint|qualifying> <year> "<event name>"
+python main.py predict <race|sprint|qualifying> <year> "<event name>"
+python main.py evaluate <race|sprint|qualifying> <year> "<event name>"
 ```
 
 The target year must be 2021 or later. For the Brazilian Grand Prix, use the event name recognized by the season schedule; the pipeline supports resolving `Brazilian Grand Prix` to the canonical `São Paulo Grand Prix` event when the schedule contains it.
@@ -35,6 +38,9 @@ Examples:
 python main.py race 2026 "Brazilian Grand Prix"
 python main.py sprint 2026 "Brazilian Grand Prix"
 python main.py qualifying 2026 "Brazilian Grand Prix"
+python main.py train race 2026 "Brazilian Grand Prix" --stage post_quali
+python main.py predict race 2026 "Brazilian Grand Prix" --stage post_quali --skip-collection
+python main.py evaluate race 2026 "Brazilian Grand Prix" --stage post_quali
 ```
 
 To score a session that already has complete results, append `--measure-variation`. The target event is held out of model training, predictions are generated from the remaining history, and actual-vs-predicted errors are written for evaluation:
@@ -45,9 +51,9 @@ python main.py race 2024 "São Paulo Grand Prix" --measure-variation
 
 This option is a backtest, not a way to create a pre-event forecast. It fails when the requested event does not have complete winner, podium, and finishing-position labels or when excluding it leaves too little training data.
 
-Each invocation collects the named event for every season from 2021 through the target year, refreshes the driver/constructor reference data, and rebuilds the feature table for the requested session. It then validates the feature table, trains the winner, podium, and finishing-position models, and predicts only the requested year and round. It does not silently substitute another round if the requested session is unavailable.
+Collection fills every missing elapsed session in each calendar from 2021 through the target round and fails clearly if required data remains absent. Feature files are content-addressed and support `pre_weekend`, `post_fp`, and `post_quali` stages. The single race model blends ranking strengths, predicts driver/team reliability, and samples coherent finishing orders; win, podium, top-10 and position outputs therefore come from one distribution.
 
-Race and sprint runs also print a 2,000-iteration `standard_dry` Monte Carlo simulation. Qualifying runs produce prediction output without a race simulation.
+Useful options are `--stage`, `--skip-collection`, `--model-path`, `--n-simulations`, `--seed`, `--scenario`, and `--measure-variation`. Backtests use temporary artifacts and never modify `models/`.
 
 ## Outputs
 
@@ -59,14 +65,14 @@ Generated files are stored under the project root:
 | `data/processed/race_features.parquet` | Rebuilt race feature table. |
 | `data/processed/sprint_features.parquet` | Rebuilt sprint feature table. |
 | `data/processed/qualifying_features.parquet` | Rebuilt qualifying feature table. |
-| `models/` | Trained winner, podium, and position model artifacts. |
+| `models/<run_id>/` | Versioned race-model artifact, training feature snapshot and provenance metadata. |
 | `data/predictions/predictions_<session>_<year>_rnd<round>.parquet` | Prediction rows for the requested session and event. |
-| `data/predictions/simulation_<session>_<year>_rnd<round>.parquet` | Saved Monte Carlo results for race and sprint runs. |
 | `data/predictions/variation_<session>_<year>_rnd<round>.parquet` | Backtest error summary, created only with `--measure-variation`. |
+| `reports/walk_forward_<session>_<year>_rnd<round>_<stage>_*.parquet` | Race-wise metrics, baselines, reliability tables, predictions and bias reports. |
 
 Prediction rows include session/year/round/event and generation-time metadata so the Streamlit dashboard can discover and select saved runs. Run `streamlit run app/app.py` to view the newest artifact by default, select other saved sessions, inspect saved simulations, or review variation metrics when available. With no saved prediction files, the dashboard clearly labels its built-in sample as a demo.
 
-The terminal displays driver, constructor, win-probability, podium-probability, and expected-position columns. Race and sprint runs additionally display simulated win, podium, DNF, and position estimates. Predictions and simulations are model outputs, not guarantees of race results. Chronological grouped log-loss results automatically set the winner ensemble's model weights; if the backtest scores are missing or invalid, the pipeline retains the default 20/30/50 weights.
+The terminal keeps a dedicated `RACE PREDICTIONS` table containing forecast fields only. Predictions include DNF risk, median and P10–P90 position ranges, full `prob_p*` distributions, stage, model version, training range, scenario, simulation count, and grid-order disagreement. Actual outcomes and error metrics are printed and persisted separately.
 
 ## Verify the environment
 

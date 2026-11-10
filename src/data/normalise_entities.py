@@ -2,6 +2,8 @@
 
 from typing import Dict, Optional
 
+import pandas as pd
+
 # Constructor historical aliases to canonical modern or unified identities
 CONSTRUCTOR_ALIASES: Dict[str, str] = {
     "red bull": "Red Bull Racing",
@@ -27,10 +29,24 @@ CONSTRUCTOR_ALIASES: Dict[str, str] = {
     "scuderia alphatauri": "RB",
     "toro rosso": "RB",
     "scuderia toro rosso": "RB",
-    "rb": "RB",
+    "rb": "Racing Bulls",
     "visa cash app rb": "RB",
     "haas": "Haas",
     "haas f1 team": "Haas",
+    "racing bulls": "Racing Bulls",
+    "visa cash app racing bulls": "Racing Bulls",
+    "audi": "Audi",
+    "audi f1 team": "Audi",
+    "cadillac": "Cadillac",
+    "cadillac f1 team": "Cadillac",
+}
+
+# Display identities may change; operational lineage is stable across rebrands.
+TEAM_LINEAGE = {
+    "Kick Sauber": "sauber_lineage", "Audi": "sauber_lineage",
+    "RB": "rb_lineage", "Racing Bulls": "rb_lineage",
+    "Aston Martin": "aston_lineage", "Alpine": "alpine_lineage",
+    "Haas": "haas", "Cadillac": "cadillac",
 }
 
 # Driver abbreviations to full names
@@ -93,15 +109,38 @@ def normalise_constructor(name: Optional[str]) -> str:
     if not name or str(name).strip() == "" or str(name).lower() == "nan":
         return "Unknown Team"
     clean = str(name).strip().casefold()
-    return CONSTRUCTOR_ALIASES.get(clean, str(name).strip())
+    canonical = CONSTRUCTOR_ALIASES.get(clean, str(name).strip())
+    return "Racing Bulls" if canonical == "RB" else canonical
 
 
-def normalise_driver_name(abbreviation: Optional[str]) -> str:
+def normalise_driver_name(abbreviation: Optional[str], lookup=None) -> str:
     """Resolve full driver name from 3-letter abbreviation."""
     if not abbreviation:
         return "Unknown Driver"
     abbr = str(abbreviation).strip().upper()
-    return DRIVER_NAMES.get(abbr, abbr)
+    return (lookup or {}).get(abbr, DRIVER_NAMES.get(abbr, abbr))
+
+
+def constructor_lineage(name: Optional[str]) -> str:
+    canonical = normalise_constructor(name)
+    return TEAM_LINEAGE.get(canonical, canonical.casefold().replace(" ", "_"))
+
+
+def build_driver_lookup(results: pd.DataFrame) -> dict:
+    """Resolve latest nonblank names, preferring full names over broadcast names."""
+    if "Abbreviation" not in results.columns:
+        return {}
+    ordered = results.copy()
+    if "SessionStartUtc" in ordered.columns:
+        ordered = ordered.sort_values("SessionStartUtc", na_position="first")
+    lookup = {}
+    for column in ("BroadcastName", "FullName"):
+        if column not in ordered.columns:
+            continue
+        for abbreviation, name in zip(ordered["Abbreviation"], ordered[column]):
+            if pd.notna(name) and str(name).strip() and str(name).casefold() != "nan":
+                lookup[str(abbreviation).strip().upper()] = str(name).strip()
+    return lookup
 
 
 def normalise_circuit(name: Optional[str]) -> str:

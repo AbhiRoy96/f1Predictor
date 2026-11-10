@@ -171,7 +171,8 @@ def _frame_from_session(session, attribute):
     return frame
 
 
-def collect_event(year: int, event_name: str, event=None, now=None, raise_on_failure=False):
+def collect_event(year: int, event_name: str, event=None, now=None, raise_on_failure=False,
+                  session_types=None):
     """Collect each scheduled session independently for a single event."""
     _enable_cache()
     if event is None:
@@ -195,6 +196,8 @@ def collect_event(year: int, event_name: str, event=None, now=None, raise_on_fai
     collected = []
     failures = []
     for session_name, session_type, session_start in _session_specs(event):
+        if session_types is not None and session_type not in session_types:
+            continue
         if not pd.isna(session_start) and session_start > now:
             print(f"Skipping future session {event_name} {session_name} ({session_start})")
             continue
@@ -222,6 +225,10 @@ def collect_event(year: int, event_name: str, event=None, now=None, raise_on_fai
         messages = _with_metadata(
             _frame_from_session(session, "race_control_messages"), metadata
         )
+
+        if (results is None or results.empty) and (laps is None or laps.empty):
+            failures.append(f"{session_name}: no results or lap data returned")
+            continue
 
         stem = f"{year}_{session_type.lower()}"
         _persist_frame(

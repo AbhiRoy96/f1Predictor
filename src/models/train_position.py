@@ -1,4 +1,4 @@
-"""Training and evaluation of finishing position prediction models."""
+"""Legacy position-regression baseline; use RacePredictor for production predictions."""
 
 import argparse
 from pathlib import Path

@@ -19,6 +19,7 @@ from src.models.evaluate import (
 from src.models.train_winner import (
     create_logistic_regression_pipeline,
     derive_ensemble_weights,
+    extract_features_and_target,
 )
 
 
@@ -39,6 +40,21 @@ class TestBaselinesAndModels(unittest.TestCase):
         probs = model.predict_proba(self.single_race)[:, 1]
         self.assertAlmostEqual(probs.sum(), 1.0, places=4)
         self.assertEqual(probs.argmax(), 0)  # VER has best qualifying position
+
+    def test_pole_baseline_prefers_actual_grid(self):
+        frame = self.single_race.copy()
+        frame["grid_position"] = [4, 3, 2, 1]
+        self.assertEqual(PolePositionBaseline().predict_proba(frame)[:, 1].argmax(), 3)
+
+    def test_feature_extraction_excludes_targets_and_numeric_provenance(self):
+        frame = self.single_race.copy()
+        frame["target_unknown_future_label"] = [1, 2, 3, 4]
+        frame["FeatureCutoffUtc"] = 1234
+        frame["history_source_max_utc"] = 1234
+        frame["grid_position"] = [1, 2, 3, 4]
+        _, _, columns = extract_features_and_target(frame)
+        self.assertIn("grid_position", columns)
+        self.assertFalse(any(c.startswith("target_") or "utc" in c.lower() for c in columns))
 
     def test_championship_leader_baseline(self):
         model = ChampionshipLeaderBaseline()

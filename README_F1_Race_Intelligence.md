@@ -8,7 +8,6 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
 ![Data](https://img.shields.io/badge/Data-Parquet-orange)
 ![ML](https://img.shields.io/badge/ML-Scikit--learn%20%7C%20XGBoost-green)
-![Tracking](https://img.shields.io/badge/Experiments-MLflow-purple)
 ![UI](https://img.shields.io/badge/UI-Streamlit-red)
 
 ------------------------------------------------------------------------

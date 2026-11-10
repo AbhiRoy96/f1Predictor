@@ -3,6 +3,12 @@ import re
 import numpy as np
 import pandas as pd
 
+from src.data.normalise_entities import (
+    build_driver_lookup, constructor_lineage, normalise_circuit,
+    normalise_constructor, normalise_driver_name,
+)
+from src.utils.config import get_feature_columns
+
 RAW = Path("data/raw")
 OUTPUT = Path("data/processed")
 TARGET_TYPES = {"Q", "SQ", "S", "R"}
@@ -20,6 +26,8 @@ SESSION_ALIASES = {
     "practice 3": "FP3",
 }
 WEATHER_COLUMNS = ("AirTemp", "TrackTemp", "Humidity", "Pressure", "WindSpeed", "Rainfall")
+STAGES = ("pre_weekend", "post_fp", "post_quali")
+NEUTRAL_POSITION = 10.5
 
 
 def _session_code(value):
@@ -98,7 +106,7 @@ def _normalize_results(frame):
         frame["TeamName"] = np.nan
     if "SessionType" not in frame:
         frame["SessionType"] = "R"
-    for column, default in (("Position", np.nan), ("Points", 0), ("GridPosition", np.nan)):
+    for column, default in (("Position", np.nan), ("Points", np.nan), ("GridPosition", np.nan)):
         if column not in frame:
             frame[column] = default
 
@@ -106,7 +114,7 @@ def _normalize_results(frame):
     frame["RoundNumber"] = pd.to_numeric(frame["RoundNumber"], errors="coerce").fillna(0)
     frame["SessionType"] = frame["SessionType"].map(_session_code)
     frame["Position"] = pd.to_numeric(frame["Position"], errors="coerce")
-    frame["Points"] = pd.to_numeric(frame["Points"], errors="coerce").fillna(0)
+    frame["Points"] = pd.to_numeric(frame["Points"], errors="coerce")
     frame["GridPosition"] = pd.to_numeric(frame["GridPosition"], errors="coerce")
     frame["SessionStartUtc"] = pd.to_datetime(frame.get("SessionStartUtc"), utc=True, errors="coerce")
     if "CircuitName" not in frame:
@@ -125,16 +133,12 @@ def _normalize_results(frame):
         key = (int(row["Year"]), int(row["RoundNumber"]), row["SessionType"])
         frame.at[index, "SessionStartUtc"] = schedule_lookup.get(key, pd.NaT)
 
-    missing_start = frame["SessionStartUtc"].isna()
-    for index in frame.index[missing_start]:
-        row = frame.loc[index]
-        year = int(row["Year"])
-        round_number = int(row["RoundNumber"])
-        rank = SESSION_RANK.get(row["SessionType"], 8)
-        frame.at[index, "SessionStartUtc"] = (
-            pd.Timestamp(year=year, month=1, day=1, tz="UTC")
-            + pd.Timedelta(days=max(round_number - 1, 0) * 7, hours=rank)
-        )
+    # Never invent timestamps: unknown session provenance cannot be a predictor.
+    frame["TeamName"] = frame["TeamName"].map(normalise_constructor)
+    frame["team_lineage"] = frame["TeamName"].map(constructor_lineage)
+    frame["CircuitName"] = frame["CircuitName"].map(normalise_circuit)
+    frame["Position"] = frame["Position"].where(frame["Position"].ge(1))
+    frame["_dnf"], frame["_mechanical"], frame["_collision"] = _dnf_labels(frame)
 
     frame["_race_outcome"] = frame["SessionType"].isin(RACE_TYPES)
     frame["_winner"] = (frame["_race_outcome"] & frame["Position"].eq(1)).astype(int)
@@ -150,77 +154,18 @@ def _normalize_results(frame):
     ).reset_index(drop=True)
 
 
-def _team_sessions(results):
-    eligible = results[results["_category"].isin(["race", "qualifying"])].copy()
-    if eligible.empty:
-        return pd.DataFrame()
-    return (
-        eligible.groupby(
-            ["Year", "RoundNumber", "SessionType", "SessionStartUtc", "CircuitName", "TeamName"],
-            dropna=False,
-            as_index=False,
-        )
-        .agg(
-            session_points=("Points", "sum"),
-            session_wins=("_winner", "sum"),
-            session_podiums=("_podium", "sum"),
-            session_avg_position=("Position", "mean"),
-        )
-        .assign(_category=lambda data: np.where(data["SessionType"].isin(RACE_TYPES), "race", "qualifying"))
-    )
-
-
-def _history_features(history, category, year, circuit, prefix):
-    current = history[history["Year"].eq(year)]
-    at_circuit = history[history["CircuitName"].astype(str).eq(str(circuit))]
-    recent = history.tail(5)
-    metrics = {
-        "career_starts": len(history),
-        "career_wins": int(history["_winner"].sum()),
-        "career_podiums": int(history["_podium"].sum()),
-        "career_points": float(history["Points"].sum()),
-        "career_avg_position": history["Position"].mean(),
-        "season_starts": len(current),
-        "season_wins": int(current["_winner"].sum()),
-        "season_podiums": int(current["_podium"].sum()),
-        "season_points": float(current["Points"].sum()),
-        "season_avg_position": current["Position"].mean(),
-        "circuit_starts": len(at_circuit),
-        "circuit_wins": int(at_circuit["_winner"].sum()),
-        "circuit_podiums": int(at_circuit["_podium"].sum()),
-        "circuit_points": float(at_circuit["Points"].sum()),
-        "circuit_avg_position": at_circuit["Position"].mean(),
-        "form_3": recent.tail(3)["Position"].mean(),
-        "form_5": recent["Position"].mean(),
-        "points_5": float(recent["Points"].sum()),
-    }
-    return {f"{prefix}_{category}_{name}": value for name, value in metrics.items()}
-
-
-def _team_history_features(history, category, year, circuit):
-    current = history[history["Year"].eq(year)]
-    at_circuit = history[history["CircuitName"].astype(str).eq(str(circuit))]
-    recent = history.tail(5)
-    metrics = {
-        "career_sessions": len(history),
-        "career_wins": int(history["session_wins"].sum()),
-        "career_podiums": int(history["session_podiums"].sum()),
-        "career_points": float(history["session_points"].sum()),
-        "career_avg_position": history["session_avg_position"].mean(),
-        "season_sessions": len(current),
-        "season_wins": int(current["session_wins"].sum()),
-        "season_podiums": int(current["session_podiums"].sum()),
-        "season_points": float(current["session_points"].sum()),
-        "season_avg_position": current["session_avg_position"].mean(),
-        "circuit_sessions": len(at_circuit),
-        "circuit_wins": int(at_circuit["session_wins"].sum()),
-        "circuit_podiums": int(at_circuit["session_podiums"].sum()),
-        "circuit_points": float(at_circuit["session_points"].sum()),
-        "circuit_avg_position": at_circuit["session_avg_position"].mean(),
-        "points_5": float(recent["session_points"].sum()),
-        "form_5": recent["session_avg_position"].mean(),
-    }
-    return {f"constructor_{category}_{name}": value for name, value in metrics.items()}
+def _dnf_labels(frame):
+    status = frame.get("Status", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+    classification = frame.get("ClassifiedPosition", pd.Series("", index=frame.index)).fillna("").astype(str)
+    finished = status.str.match(r"(?i)^(finished|\+\d+ laps?)$")
+    collision = status.str.contains(r"(?i)collision|accident|spun off", regex=True)
+    mechanical = status.str.contains(
+        r"(?i)engine|gearbox|transmission|hydraul|electri|brake|suspension|power|oil|water|fuel|clutch|driveshaft|radiator|overheat|technical|mechanical|turbo|exhaust|battery|differential|steering|puncture|tyre", regex=True)
+    retired = collision | mechanical | classification.str.upper().isin(["R", "RETIRED"])
+    retired |= status.str.contains(r"(?i)^retired$", regex=True)
+    known = finished | retired
+    race = frame["SessionType"].isin(RACE_TYPES)
+    return tuple(values.astype(float).where(known & race) for values in (retired, mechanical, collision))
 
 
 def _prepare_auxiliary(frame, results):
@@ -236,23 +181,54 @@ def _prepare_auxiliary(frame, results):
     frame["SessionStartUtc"] = pd.to_datetime(frame["SessionStartUtc"], utc=True, errors="coerce")
     if "SessionType" in frame:
         frame["SessionType"] = frame["SessionType"].map(_session_code)
-        lookup = results.dropna(subset=["SessionStartUtc"]).drop_duplicates(
-            ["Year", "RoundNumber", "SessionType"]
-        ).set_index(["Year", "RoundNumber", "SessionType"])["SessionStartUtc"]
-        for index in frame.index[frame["SessionStartUtc"].isna()]:
-            row = frame.loc[index]
-            key = (row["Year"], row["RoundNumber"], row["SessionType"])
-            if key in lookup.index:
-                frame.at[index, "SessionStartUtc"] = lookup.loc[key]
-    return frame
+        frame = frame.loc[frame["SessionType"].isin(SESSION_RANK)]
+        keys = ["Year", "RoundNumber", "SessionType"]
+        lookup = results.dropna(subset=["SessionStartUtc"]).drop_duplicates(keys)[keys + ["SessionStartUtc"]]
+        frame = frame.merge(lookup.rename(columns={"SessionStartUtc": "_canonical_start"}),
+                            on=keys, how="left")
+        mismatch = (frame["SessionStartUtc"].notna() & frame["_canonical_start"].notna()
+                    & frame["SessionStartUtc"].ne(frame["_canonical_start"]))
+        frame = frame.loc[~mismatch].copy()
+        frame["SessionStartUtc"] = frame["SessionStartUtc"].fillna(frame["_canonical_start"])
+        frame = frame.drop(columns="_canonical_start")
+    # Session type is mandatory even if a timestamp happens to be present.
+    if "SessionType" not in frame:
+        return pd.DataFrame()
+    frame = frame.dropna(subset=["SessionStartUtc", "Year", "RoundNumber"])
+    if "Abbreviation" not in frame and "Driver" in frame:
+        frame["Abbreviation"] = frame["Driver"]
+    if "Abbreviation" not in frame and "DriverNumber" in frame and "DriverNumber" in results:
+        mapping = results.dropna(subset=["DriverNumber"]).assign(
+            DriverNumber=lambda data: data["DriverNumber"].astype(str)
+        ).drop_duplicates(["Year", "RoundNumber", "DriverNumber"])
+        frame["DriverNumber"] = frame["DriverNumber"].astype(str)
+        frame = frame.merge(mapping[["Year", "RoundNumber", "DriverNumber", "Abbreviation"]],
+                            on=["Year", "RoundNumber", "DriverNumber"], how="left")
+    return frame.sort_values("SessionStartUtc")
 
 
 def _prior_weekend_rows(frame, target):
     if frame.empty or "SessionStartUtc" not in frame:
         return pd.DataFrame()
     same_event = frame["Year"].eq(target["Year"]) & frame["RoundNumber"].eq(target["RoundNumber"])
-    earlier = frame["SessionStartUtc"].notna() & frame["SessionStartUtc"].lt(target["SessionStartUtc"])
-    return frame[same_event & earlier].copy()
+    earlier = frame["SessionStartUtc"].notna() & frame["SessionStartUtc"].lt(target["FeatureCutoffUtc"])
+    allowed = frame["SessionType"].ne(target["SessionType"])
+    if target["stage"] == "pre_weekend":
+        allowed &= False
+    elif target["stage"] == "post_fp":
+        allowed &= frame["SessionType"].isin(["FP1", "FP2", "FP3"])
+    # Explicit observation times must precede the cutoff too.
+    for column in ("Date", "Timestamp", "PublishedAt", "LapStartDate"):
+        if column in frame:
+            observed = pd.to_datetime(frame[column], utc=True, errors="coerce")
+            earlier &= observed.isna() | observed.lt(target["FeatureCutoffUtc"])
+    if "Time" in frame and pd.api.types.is_timedelta64_dtype(frame["Time"]):
+        observed = frame["SessionStartUtc"] + frame["Time"]
+        earlier &= observed.isna() | observed.lt(target["FeatureCutoffUtc"])
+    if "SessionEndUtc" in frame:
+        end = pd.to_datetime(frame["SessionEndUtc"], utc=True, errors="coerce")
+        earlier &= end.isna() | end.lt(target["FeatureCutoffUtc"])
+    return frame[same_event & earlier & allowed].copy()
 
 
 def _seconds(values):
@@ -276,7 +252,8 @@ def _weekend_features(target, abbreviation, laps, weather, messages, results):
                     driver_map.get((row.Year, row.RoundNumber, row.DriverNumber), np.nan)
                     for row in prior_laps.itertuples()
                 ]
-        driver_laps = prior_laps[prior_laps["Abbreviation"].astype(str).eq(str(abbreviation))]
+        driver_laps = (prior_laps[prior_laps["Abbreviation"].astype(str).eq(str(abbreviation))]
+                       if "Abbreviation" in prior_laps else pd.DataFrame())
         lap_seconds = _seconds(driver_laps["LapTime"]) if "LapTime" in driver_laps else pd.Series(dtype=float)
         features["prior_weekend_lap_count"] = len(driver_laps)
         features["prior_weekend_best_lap_seconds"] = lap_seconds.min()
@@ -289,7 +266,9 @@ def _weekend_features(target, abbreviation, laps, weather, messages, results):
             driver_laps["Compound"].nunique(dropna=True) if "Compound" in driver_laps else np.nan
         )
         features["prior_weekend_last_compound"] = (
-            driver_laps["Compound"].dropna().iloc[-1]
+            driver_laps["Compound"].dropna().astype(str).str.upper().map(
+                {"SOFT": 1, "MEDIUM": 2, "HARD": 3, "INTERMEDIATE": 4, "WET": 5}
+            ).iloc[-1]
             if "Compound" in driver_laps and driver_laps["Compound"].notna().any() else np.nan
         )
     else:
@@ -311,7 +290,7 @@ def _weekend_features(target, abbreviation, laps, weather, messages, results):
             features[f"prior_weekend_{column.casefold()}_last"] = np.nan
 
     prior_messages = _prior_weekend_rows(messages, target)
-    if prior_messages.empty and messages.empty:
+    if prior_messages.empty:
         features["prior_weekend_message_count"] = np.nan
         for term in ("safety_car", "virtual_safety_car", "yellow_flag", "red_flag"):
             features[f"prior_weekend_{term}_messages"] = np.nan
@@ -345,7 +324,7 @@ def _news_features(target, news):
     if published_column is None:
         return {"prior_news_item_count": np.nan, "prior_news_tyre_mentions": np.nan, "prior_news_weather_mentions": np.nan}
     published = pd.to_datetime(news[published_column], utc=True, errors="coerce")
-    mask = published.notna() & published.lt(target["SessionStartUtc"])
+    mask = published.notna() & published.lt(target["FeatureCutoffUtc"])
     if "Year" in news:
         mask &= pd.to_numeric(news["Year"], errors="coerce").eq(target["Year"])
     event_column = next((column for column in ("EventName", "CircuitName") if column in news), None)
@@ -360,20 +339,241 @@ def _news_features(target, news):
     text_column = next((column for column in ("Text", "Headline", "Description") if column in selected), None)
     text = selected[text_column].fillna("").astype(str).str.casefold() if text_column else pd.Series("", index=selected.index)
     return {
+        "news_source_max_utc": published.loc[mask].max(),
         "prior_news_item_count": len(selected),
         "prior_news_tyre_mentions": int(text.str.contains(r"tyre|tire", regex=True).sum()),
         "prior_news_weather_mentions": int(text.str.contains(r"weather|rain|wind|temperature", regex=True).sum()),
     }
 
 
-def build_features(results, laps=None, weather=None, messages=None, news=None):
-    """Build target-session tables using only sessions and observations before each start."""
+class _HistoryIndex:
+    """Prefix aggregates built once; each query uses three binary searches."""
+
+    def __init__(self, results, team=False):
+        eligible = results.loc[results["_category"].isin(["race", "qualifying"])
+                               & results["Position"].notna()
+                               & results["SessionStartUtc"].notna()].copy()
+        self.team = team
+        self.entity = "team_lineage" if team else "Abbreviation"
+        if team:
+            eligible = eligible.groupby(
+                ["team_lineage", "_category", "Year", "RoundNumber", "CircuitName", "SessionStartUtc"],
+                as_index=False, dropna=False,
+            ).agg(Position=("Position", "mean"), Points=("Points", "sum"),
+                  _winner=("_winner", "sum"), _podium=("_podium", "sum"),
+                  _dnf=("_dnf", "mean"), _mechanical=("_mechanical", "mean"),
+                  _collision=("_collision", "mean"))
+        self.groups = {}
+        for dimension in (None, "Year", "CircuitName"):
+            keys = [self.entity, "_category"] + ([dimension] if dimension else [])
+            for key, group in eligible.groupby(keys, dropna=False):
+                group = group.sort_values("SessionStartUtc")
+                stats = pd.DataFrame(index=group.index)
+                stats["count"] = np.arange(1, len(group) + 1)
+                for column in ("Points", "_winner", "_podium"):
+                    stats[column] = group[column].fillna(0).cumsum()
+                stats["position"] = group["Position"].expanding().mean()
+                stats["form_3"] = group["Position"].rolling(3, min_periods=1).mean()
+                stats["form_5"] = group["Position"].rolling(5, min_periods=1).mean()
+                stats["points_5"] = group["Points"].rolling(5, min_periods=1).sum()
+                stats["ewma_position"] = group["Position"].ewm(halflife=5).mean()
+                stats["ewma_points"] = group["Points"].ewm(halflife=5).mean()
+                if not team:
+                    grid = group["GridPosition"].where(group["GridPosition"].gt(0))
+                    stats["finish_vs_grid"] = (group["Position"] - grid).ewm(halflife=5).mean()
+                    stats["position_change"] = (group["Position"] - grid).abs().expanding().mean()
+                for column in ("_dnf", "_mechanical", "_collision"):
+                    stats[column] = group[column].fillna(0).cumsum()
+                    stats[column + "_n"] = group[column].notna().cumsum()
+                self.groups[(dimension, key)] = (group["SessionStartUtc"].dt.as_unit("ns").astype("int64").to_numpy(),
+                                                  stats.to_dict("records"))
+
+    def _lookup(self, entity, category, cutoff, dimension=None, value=None):
+        key = (entity, category) + ((value,) if dimension else ())
+        indexed = self.groups.get((dimension, key))
+        if indexed is None or pd.isna(cutoff):
+            return {}, pd.NaT
+        times, records = indexed
+        index = times.searchsorted(cutoff.value, side="left") - 1
+        if index < 0:
+            return {}, pd.NaT
+        return records[index], pd.Timestamp(times[index], tz="UTC")
+
+    def features(self, target, category):
+        entity = target[self.entity]
+        cutoff = target["FeatureCutoffUtc"]
+        prefix = ("constructor" if self.team else "driver") + "_" + category + "_"
+        features = {}
+        career, source = self._lookup(entity, category, cutoff)
+        current = {}
+        for name, dimension, value in (("career", None, None), ("season", "Year", target["Year"]),
+                                       ("circuit", "CircuitName", target["CircuitName"])):
+            stats, _ = self._lookup(entity, category, cutoff, dimension, value)
+            if name == "season":
+                current = stats
+            features[prefix + name + ("_sessions" if self.team else "_starts")] = stats.get("count", 0)
+            for metric, column in (("wins", "_winner"), ("podiums", "_podium"), ("points", "Points")):
+                features[prefix + name + "_" + metric] = stats.get(column, 0)
+            features[prefix + name + "_avg_position"] = stats.get("position", np.nan)
+        for metric in ("form_3", "form_5", "points_5", "ewma_position", "ewma_points"):
+            features[prefix + metric] = career.get(metric, np.nan if metric != "points_5" else 0)
+        if not self.team:
+            features[prefix + "ewma_finish_vs_grid"] = career.get("finish_vs_grid", np.nan)
+            features[prefix + "position_change"] = career.get("position_change", np.nan)
+        n = current.get("count", 0)
+        weight = n / (n + 5)
+        year_start = pd.Timestamp(year=int(target["Year"]), month=1, day=1, tz="UTC")
+        previous, _ = self._lookup(entity, category, min(cutoff, year_start))
+        prior = previous.get("position", NEUTRAL_POSITION)
+        features[prefix + "strength_position"] = weight * current.get("position", prior) + (1 - weight) * prior
+        features[prefix + "strength_current_weight"] = weight
+        for metric, column, prior_rate in (("dnf", "_dnf", .05), ("mechanical", "_mechanical", .03),
+                                           ("collision", "_collision", .02)):
+            features[prefix + metric + "_rate_shrunk"] = (
+                career.get(column, 0) + 20 * prior_rate) / (career.get(column + "_n", 0) + 20)
+        return features, source
+
+
+def _event_groups(frame):
+    if frame.empty:
+        return {}
+    return dict(tuple(frame.groupby(["Year", "RoundNumber"], sort=False)))
+
+
+def _stage_cutoff(target, event, stage):
+    start = target["SessionStartUtc"]
+    earlier = event.loc[event["SessionStartUtc"].le(start)]
+    if stage == "pre_weekend":
+        return earlier["SessionStartUtc"].min()
+    if stage == "post_fp":
+        non_practice = earlier.loc[~earlier["SessionType"].isin(["FP1", "FP2", "FP3"])]
+        return non_practice["SessionStartUtc"].min()
+    return start
+
+
+def _neutral_positions(row):
+    columns = set(get_feature_columns(pd.DataFrame([row])))
+    for column, value in list(row.items()):
+        if column in columns:
+            if pd.isna(value):
+                row[column + "_is_missing"] = 1
+            else:
+                row[column + "_is_missing"] = 0
+            if ("avg_position" in column or "_form_" in column or column.endswith("ewma_position")
+                    or column in ("grid_position", "quali_position", "fp2_long_run_pace_rank")):
+                if pd.isna(value) or value <= 0:
+                    row[column] = NEUTRAL_POSITION
+
+
+def _stage_features(target, event, laps, weather, messages):
+    prior = _prior_weekend_rows(event, target)
+    selected = [_prior_weekend_rows(frame, target) for frame in (laps, weather, messages)]
+    provenance = [frame for frame in [prior] + selected if not frame.empty]
+    features = {
+        "weekend_source_max_utc": max(frame["SessionStartUtc"].max() for frame in provenance) if provenance else pd.NaT,
+        "weekend_source_session_types": ",".join(sorted(set().union(
+            *(set(frame["SessionType"]) for frame in provenance)))) if provenance else "",
+        "grid_source_max_utc": pd.NaT,
+    }
+    for column in ("grid_position", "quali_position", "quali_gap_to_pole_pct",
+                   "quali_gap_to_teammate_pct", "grid_penalty_places", "pit_lane_start",
+                   "fp2_long_run_pace_rank", "fp_best_lap_gap_pct", "fp_teammate_gap_pct"):
+        features[column] = np.nan
+    qualifying_type = "SQ" if target["SessionType"] == "S" else "Q"
+    qualifying = prior.loc[prior["SessionType"].eq(qualifying_type)]
+    driver = qualifying.loc[qualifying["Abbreviation"].eq(target["Abbreviation"])]
+    if target["stage"] == "post_quali" and target["SessionType"] in RACE_TYPES:
+        if not driver.empty:
+            features["quali_position"] = driver.iloc[-1]["Position"]
+            best = pd.DataFrame(index=qualifying.index)
+            for column in ("Q1", "Q2", "Q3", "BestLapTime"):
+                if column in qualifying:
+                    best[column] = _seconds(qualifying[column])
+            times = best.min(axis=1).where(lambda values: values.gt(0))
+            own_time = times.loc[driver.index].min()
+            mates = qualifying.loc[qualifying["team_lineage"].eq(target["team_lineage"])
+                                    & qualifying["Abbreviation"].ne(target["Abbreviation"])]
+            pole, mate = times.min(), times.reindex(mates.index).min()
+            if pd.notna(pole) and pd.notna(own_time):
+                features["quali_gap_to_pole_pct"] = (own_time / pole - 1) * 100
+            if pd.notna(mate) and pd.notna(own_time):
+                features["quali_gap_to_teammate_pct"] = (own_time / mate - 1) * 100
+            grid = driver.iloc[-1]["GridPosition"]
+            if pd.notna(grid) and grid >= 0:
+                features["grid_position"] = grid if grid > 0 else np.nan
+                features["pit_lane_start"] = int(grid == 0)
+                features["grid_source_max_utc"] = driver.iloc[-1]["SessionStartUtc"]
+        published = pd.to_datetime(target.get("GridPublishedAt"), utc=True, errors="coerce")
+        if pd.notna(published) and published < target["FeatureCutoffUtc"]:
+            grid = target["GridPosition"]
+            if pd.notna(grid) and grid >= 0:
+                features["grid_position"] = grid if grid > 0 else np.nan
+                features["pit_lane_start"] = int(grid == 0)
+                features["grid_source_max_utc"] = published
+        if pd.notna(features["grid_position"]) and pd.notna(features["quali_position"]):
+            features["grid_penalty_places"] = features["quali_position"] - features["grid_position"]
+
+    practice = selected[0]
+    if not practice.empty and "LapTime" in practice and "Abbreviation" in practice:
+        practice = practice.loc[practice["SessionType"].isin(["FP1", "FP2", "FP3"])].copy()
+        practice["seconds"] = _seconds(practice["LapTime"])
+        practice = practice.loc[practice["seconds"].gt(0)]
+        if "IsAccurate" in practice:
+            practice = practice.loc[practice["IsAccurate"].fillna(False).astype(bool)]
+        for column in ("PitInTime", "PitOutTime"):
+            if column in practice:
+                practice = practice.loc[practice[column].isna()]
+        best = practice.groupby("Abbreviation")["seconds"].min()
+        own = best.get(target["Abbreviation"], np.nan)
+        if pd.notna(own) and not best.empty:
+            features["fp_best_lap_gap_pct"] = (own / best.min() - 1) * 100
+            mate_codes = prior.loc[prior["team_lineage"].eq(target["team_lineage"])
+                                   & prior["Abbreviation"].ne(target["Abbreviation"]), "Abbreviation"]
+            mate = best.reindex(mate_codes).min()
+            if pd.notna(mate):
+                features["fp_teammate_gap_pct"] = (own / mate - 1) * 100
+        long_runs = practice.loc[practice["SessionType"].eq("FP2")].copy()
+        if not long_runs.empty and "Stint" in long_runs:
+            # Within-compound/tyre-age residuals avoid rewarding fresh soft tyres.
+            correction = [column for column in ("Compound", "TyreLife") if column in long_runs]
+            if correction:
+                long_runs["pace"] = long_runs["seconds"] - long_runs.groupby(
+                    correction, dropna=False)["seconds"].transform("median")
+            else:
+                long_runs["pace"] = long_runs["seconds"]
+            stints = long_runs.groupby(["Abbreviation", "Stint"])["pace"].agg(["median", "count"])
+            pace = stints.loc[stints["count"].ge(5), "median"].groupby("Abbreviation").median()
+            features["fp2_long_run_pace_rank"] = pace.rank(method="min").get(target["Abbreviation"], np.nan)
+    return features
+
+
+def build_features(results, laps=None, weather=None, messages=None, news=None, stage="post_quali"):
+    """Return session-code -> numeric feature tables, with labels and provenance metadata.
+
+    Upcoming targets must be supplied by the caller with a scheduled SessionStartUtc
+    and NaN Position/Points/Status. No dates, entrants or outcomes are fabricated.
+    GridPosition on a race result is ignored unless GridPublishedAt proves it was
+    available before the cutoff; earlier qualifying GridPosition is also accepted.
+    """
+    if stage not in STAGES:
+        raise ValueError(f"Unknown stage {stage!r}; expected one of {STAGES}")
     results = _normalize_results(results)
     laps = _prepare_auxiliary(laps, results)
     weather = _prepare_auxiliary(weather, results)
     messages = _prepare_auxiliary(messages, results)
     news = pd.DataFrame() if news is None else news.copy()
-    teams = _team_sessions(results)
+    driver_history = _HistoryIndex(results)
+    team_history = _HistoryIndex(results, team=True)
+    circuit_history = _HistoryIndex(results.assign(Abbreviation=results["CircuitName"]))
+    event_results = _event_groups(results)
+    auxiliary = [_event_groups(frame) for frame in (laps, weather, messages)]
+    completed_races = results.loc[results["SessionType"].eq("R") & results["Position"].notna()
+                                  & results["SessionStartUtc"].notna()].drop_duplicates(
+        ["Year", "RoundNumber"])
+    era_race_times = {
+        era: completed_races.loc[completed_races["Year"].ge(era), "SessionStartUtc"].sort_values().dt.as_unit("ns").astype("int64").to_numpy()
+        for era in (2014, 2022, 2026)
+    }
     features_by_type = {}
 
     for target_type in TARGET_TYPES:
@@ -382,6 +582,15 @@ def build_features(results, laps=None, weather=None, messages=None, news=None):
             continue
         rows = []
         for _, target in targets.iterrows():
+            target = target.copy()
+            key = (target["Year"], target["RoundNumber"])
+            event = event_results[key]
+            # Auxiliary-only practice sessions also establish the weekend boundary.
+            event_frames = [event] + [group[key] for group in auxiliary if key in group]
+            timeline = pd.concat([frame[["SessionType", "SessionStartUtc"]] for frame in event_frames])
+            target["FeatureCutoffUtc"] = _stage_cutoff(target, timeline, stage)
+            target["stage"] = stage
+            known = pd.notna(target["Position"])
             row = {
                 "Year": target["Year"],
                 "RoundNumber": target["RoundNumber"],
@@ -392,30 +601,48 @@ def build_features(results, laps=None, weather=None, messages=None, news=None):
                 "Abbreviation": target["Abbreviation"],
                 "DriverNumber": target.get("DriverNumber", np.nan),
                 "TeamName": target["TeamName"],
+                "DriverName": normalise_driver_name(target["Abbreviation"], {
+                    **build_driver_lookup(event.loc[event["SessionStartUtc"].le(target["FeatureCutoffUtc"])]),
+                    **build_driver_lookup(pd.DataFrame([target])),
+                }),
+                "team_lineage": target["team_lineage"],
+                "stage": stage,
+                "FeatureCutoffUtc": target["FeatureCutoffUtc"],
+                "news_source_max_utc": pd.NaT,
                 "target_position": target["Position"],
                 "target_points": target["Points"],
-                "target_winner": int(target["_winner"]),
-                "target_podium": int(target["_podium"]),
-                "target_pole": int(target_type in QUALIFYING_TYPES and target["Position"] == 1),
+                "target_winner": int(target["_winner"]) if known else np.nan,
+                "target_podium": int(target["_podium"]) if known else np.nan,
+                "target_pole": int(target_type in QUALIFYING_TYPES and target["Position"] == 1) if known else np.nan,
+                "target_dnf": target["_dnf"],
+                "target_dnf_mechanical": target["_mechanical"],
+                "target_dnf_collision": target["_collision"],
+                "regulation_era": 2026 if target["Year"] >= 2026 else (2022 if target["Year"] >= 2022 else 2014),
+                "rounds_into_era": max(target["RoundNumber"] - 1, 0),
             }
-            start = target["SessionStartUtc"]
-            past = results[results["SessionStartUtc"].lt(start)]
-            for category, session_types in (("race", RACE_TYPES), ("qualifying", QUALIFYING_TYPES)):
-                history = past[
-                    past["Abbreviation"].eq(target["Abbreviation"])
-                    & past["SessionType"].isin(session_types)
-                ].sort_values("SessionStartUtc")
-                row.update(_history_features(history, category, target["Year"], target["CircuitName"], "driver"))
-
-                team_history = teams[
-                    teams["SessionStartUtc"].lt(start)
-                    & teams["TeamName"].eq(target["TeamName"])
-                    & teams["_category"].eq(category)
-                ].sort_values("SessionStartUtc") if not teams.empty else pd.DataFrame()
-                row.update(_team_history_features(team_history, category, target["Year"], target["CircuitName"]))
-
-            row.update(_weekend_features(target, target["Abbreviation"], laps, weather, messages, results))
+            sources = []
+            for category in ("race", "qualifying"):
+                for index in (driver_history, team_history):
+                    features, source = index.features(target, category)
+                    row.update(features)
+                    if pd.notna(source):
+                        sources.append(source)
+            row["history_source_max_utc"] = max(sources) if sources else pd.NaT
+            row["team_is_new_entry"] = int(row["constructor_race_career_sessions"] == 0)
+            era_times = era_race_times[row["regulation_era"]]
+            row["rounds_into_era"] = int(era_times.searchsorted(target["FeatureCutoffUtc"].value, side="left")) if pd.notna(target["FeatureCutoffUtc"]) else 0
+            circuit_target = target.copy()
+            circuit_target["Abbreviation"] = target["CircuitName"]
+            circuit_stats, _ = circuit_history.features(circuit_target, "race")
+            row["circuit_overtaking_position_change"] = circuit_stats["driver_race_position_change"]
+            row["circuit_dnf_rate_shrunk"] = circuit_stats["driver_race_dnf_rate_shrunk"]
+            row["team_dnf_rate_shrunk"] = row["constructor_race_dnf_rate_shrunk"]
+            row["driver_incident_rate_shrunk"] = row["driver_race_collision_rate_shrunk"]
+            frames = [group.get(key, pd.DataFrame()) for group in auxiliary]
+            row.update(_weekend_features(target, target["Abbreviation"], *frames, event))
+            row.update(_stage_features(target, event, *frames))
             row.update(_news_features(target, news))
+            _neutral_positions(row)
             rows.append(row)
         features_by_type[target_type] = pd.DataFrame(rows)
     return features_by_type
@@ -426,15 +653,31 @@ def _load_news():
     return pd.read_csv(path) if path.exists() else pd.DataFrame()
 
 
+def load_laps():
+    return _read_parquets("*_laps.parquet")
+
+
+def load_weather():
+    return _read_parquets("*_weather.parquet")
+
+
+def load_messages():
+    return _read_parquets("*_messages.parquet")
+
+
+def load_news():
+    return _load_news()
+
+
+def load_feature_inputs():
+    """Auxiliary kwargs only: build_features(results, stage=stage, **inputs)."""
+    return {"laps": load_laps(), "weather": load_weather(),
+            "messages": load_messages(), "news": load_news()}
+
+
 def main():
     results = load_results()
-    tables = build_features(
-        results,
-        laps=_read_parquets("*_laps.parquet"),
-        weather=_read_parquets("*_weather.parquet"),
-        messages=_read_parquets("*_messages.parquet"),
-        news=_load_news(),
-    )
+    tables = build_features(results, **load_feature_inputs())
     OUTPUT.mkdir(parents=True, exist_ok=True)
     filenames = {"R": "race", "Q": "qualifying", "S": "sprint", "SQ": "sprint_qualifying"}
     for session_type, features in tables.items():

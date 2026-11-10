@@ -1,4 +1,4 @@
-"""Training and evaluation of podium prediction models."""
+"""Legacy standalone podium baseline; use RacePredictor for production probabilities."""
 
 import argparse
 from pathlib import Path
