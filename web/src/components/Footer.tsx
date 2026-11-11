@@ -9,8 +9,8 @@ export function Footer() {
           <li>
             <strong className="text-paper">Unofficial fan project.</strong> This application is not affiliated with,
             endorsed by or sponsored by Formula 1, FOM, the FIA, F1 TV or any team or driver. F1, FORMULA 1, GRAND PRIX
-            and related marks are trademarks of Formula One Licensing BV. The visual theme is inspired by the F1 TV
-                        style; this repository ships no official logos, fonts, images or broadcast content.
+            and related marks are trademarks of Formula One Licensing BV. This repository ships no official logos,
+            fonts, images or broadcast content.
           </li>
           <li>
             <strong className="text-paper">Probabilities, not predictions of certainty.</strong> Forecasts describe
@@ -27,19 +27,23 @@ export function Footer() {
             sampling error only. Scenario views other than the standard dry race are heuristic sensitivity analyses.
           </li>
           <li>
-            <strong className="text-paper">Historical evidence is limited.</strong> Training covers collected events only,
-            not complete championship history. Backtests span few races and do not guarantee future skill.
+            <strong className="text-paper">Historical evidence is limited.</strong> Each forecast states its history
+            coverage and held-out calibration sample. Backtests do not guarantee future skill.
           </li>
           <li>
-            <strong className="text-paper">Data sources.</strong> Prediction evidence via FastF1; season calendars, results and standings via Jolpica. Profile text and
+            <strong className="text-paper">Data sources.</strong> Prediction evidence via FastF1; season calendars, results and standings via{" "}
+            <a href="https://github.com/jolpica/jolpica-f1" className="underline">Jolpica</a>{" "}
+            under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" className="underline">CC BY-NC-SA 4.0</a>.
+            Data is for non-commercial use; commercial use requires provider permission. Profile text and
             media, where shown, come from Wikipedia and Wikimedia Commons under their own licences.
           </li>
         </ul>
         <div className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-6 text-xs text-fog">
-          <p>Released under the MIT licence. Forecasts are generated from saved point-in-time artifacts.</p>
+          <p>Application code: MIT licence. Upstream data has separate terms.</p>
           <nav className="flex gap-4" aria-label="Footer">
             <Link href="/settings" className="hover:text-paper">Settings</Link>
             <Link href="/lab" className="hover:text-paper">Model Lab</Link>
+            <Link href="/privacy" className="hover:text-paper">Privacy</Link>
           </nav>
         </div>
       </div>

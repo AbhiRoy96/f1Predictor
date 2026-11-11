@@ -32,7 +32,8 @@ DRIVER_COLUMNS = [
 META_COLUMNS = [
     "session", "year", "event_name", "round_number", "stage", "model_version", "strength_model",
     "prediction_generated_at_utc", "training_start_utc", "training_end_utc", "training_races",
-    "scenario", "simulation_count", "seed", "pl_temperature", "history_scope",
+    "scenario", "simulation_count", "seed", "pl_temperature", "history_scope", "calibration_races",
+    "forecast_phase", "source_published_at_utc",
 ]
 REPORT_NAMES = ("summary", "confidence", "reliability")
 DEMO_FIELD = [

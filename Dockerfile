@@ -4,9 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONUTF8=1
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
+COPY requirements.lock .
 ARG PIP_INDEX_URL=https://pypi.org/simple
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 RUN useradd --create-home --uid 10001 gridcast
 COPY --chown=gridcast:gridcast backend backend
 COPY --chown=gridcast:gridcast src src

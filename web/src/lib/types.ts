@@ -55,6 +55,9 @@ export interface RunMeta {
   seed?: number;
   pl_temperature?: number;
   history_scope?: string;
+  calibration_races?: number;
+  forecast_phase?: string;
+  source_published_at_utc?: string;
 }
 
 export type ReportRow = Record<string, string | number | null>;

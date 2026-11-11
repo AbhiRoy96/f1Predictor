@@ -9,7 +9,6 @@ import tempfile
 from pathlib import Path
 
 import fastf1
-import joblib
 import numpy as np
 import pandas as pd
 
@@ -21,6 +20,7 @@ from src.data.event_selection import (
     similar_circuit_keys,
 )
 from src.data.normalise_entities import normalise_driver_name
+from src.models.artifacts import dump_artifact, load_artifact
 from src.data.validate_data import validate_features_df
 from src.features.engineer_features import build_features, load_results
 from src.utils.config import PREDICTIONS_DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
@@ -85,6 +85,21 @@ def collect_historical_data(year: int, event: str, events_per_season=DEFAULT_EVE
                 RAW_DATA_DIR / f"{collection_year}_schedule.parquet", index=False)
             selected = select_related_events(schedule, target, collection_year, year,
                                              events_per_season, similar_circuits)
+            if collection_year >= year - 1:
+                # Full recent calendars provide outcomes cheaply; detailed sessions
+                # remain bounded to weekends relevant to the target circuit.
+                for _, scheduled_event in schedule.iterrows():
+                    missing = _missing_sessions(collection_year, scheduled_event) & {"Q", "SQ", "S", "R"}
+                    if missing:
+                        try:
+                            collect_event(collection_year, scheduled_event["EventName"],
+                                          event=scheduled_event, raise_on_failure=True,
+                                          session_types=missing, results_only=True)
+                            remaining = _missing_sessions(collection_year, scheduled_event) & missing
+                            if remaining:
+                                failures.append(f"{collection_year} {scheduled_event['EventName']}: {sorted(remaining)}")
+                        except Exception as exc:
+                            failures.append(f"{collection_year} {scheduled_event['EventName']}: {exc}")
             logger.info("Collection plan %s (%s/%s events): %s", collection_year, len(selected),
                         events_per_season, ", ".join(selected.EventName.astype(str)))
             for _, scheduled_event in selected.iterrows():
@@ -109,7 +124,7 @@ def collect_historical_data(year: int, event: str, events_per_season=DEFAULT_EVE
     collect_driver_constructor_stats()
     if failures:
         raise RuntimeError("Historical collection incomplete; retry missing sessions: " + "; ".join(failures))
-    logger.info("Bounded historical collection complete; other calendar events were not downloaded.")
+    logger.info("Full recent results and bounded detailed historical collection complete.")
 
 
 def _data_hash(paths, context=""):
@@ -317,13 +332,13 @@ def _train_models(feature_path, training_features=None, output_dir=None, strengt
         training_features.to_parquet(training_path, index=False)
         artifacts = train_and_save_race_model(training_path, output_dir=temporary, **options)
         # Load before the temporary directory is removed, with no production writes.
-        return joblib.load(artifacts["model_path"])
+        return load_artifact(artifacts["model_path"])
 
 
 def _model_artifact(feature_path, training, stage, session, action, model_path=None, strength_model="legacy"):
     fingerprint = _training_hash(training, strength_model)
     if model_path is not None:
-        artifact = joblib.load(model_path)
+        artifact = load_artifact(model_path)
         metadata = artifact.get("metadata", {})
         if metadata.get("training_hash") != fingerprint:
             raise ValueError("Model data/code fingerprint differs from current chronological training data; retrain it.")
@@ -338,7 +353,7 @@ def _model_artifact(feature_path, training, stage, session, action, model_path=N
                     and metadata.get("session") == session):
                 model_file = path.parent / metadata["artifact_filename"]
                 if model_file.exists():
-                    return joblib.load(model_file)
+                    return load_artifact(model_file)
         if action == "predict":
             raise RuntimeError("No matching trained model. Run the train command first or use the legacy automatic command.")
     from src.models.race_model import train_and_save_race_model
@@ -350,7 +365,7 @@ def _model_artifact(feature_path, training, stage, session, action, model_path=N
     training.to_parquet(training_path, index=False)
     options = {"strength_model": strength_model} if strength_model != "legacy" else {}
     artifacts = train_and_save_race_model(training_path, output_dir=output_dir, **options)
-    artifact = joblib.load(artifacts["model_path"])
+    artifact = load_artifact(artifacts["model_path"])
     try:
         git_sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
                                  text=True, check=True).stdout.strip()
@@ -365,7 +380,7 @@ def _model_artifact(feature_path, training, stage, session, action, model_path=N
                      "training_rows": len(training), "feature_columns": artifact.get("feature_columns", []),
                      "artifact_filename": Path(artifacts["model_path"]).name})
     artifact["metadata"] = metadata
-    joblib.dump(artifact, artifacts["model_path"])
+    dump_artifact(artifact, artifacts["model_path"])
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
     return artifact
 
@@ -394,6 +409,49 @@ def _validate_prediction_probabilities(predictions):
         raise ValueError("Inconsistent win, podium or top-10 probability totals.")
     if (np.diff(probabilities, axis=1) < -1e-12).any():
         raise ValueError("Predictions must satisfy win <= podium <= top10.")
+
+
+def _validate_official_grid(target, source_time):
+    """Require explicit, actually-used official grid evidence for every entrant."""
+    required = {"Abbreviation", "GridPosition", "GridPublishedAt", "grid_position",
+                "grid_position_is_missing", "grid_is_quali_proxy", "grid_source_max_utc",
+                "FeatureCutoffUtc"}
+    missing = required - set(target)
+    if missing:
+        raise ValueError("official_grid requires explicit published grid provenance for every entrant; "
+                         f"missing columns: {sorted(missing)}")
+    raw = pd.to_numeric(target.GridPosition, errors="coerce")
+    effective = pd.to_numeric(target.grid_position, errors="coerce")
+    published = pd.to_datetime(target.GridPublishedAt, utc=True, errors="coerce")
+    used = pd.to_datetime(target.grid_source_max_utc, utc=True, errors="coerce")
+    cutoff = pd.to_datetime(target.FeatureCutoffUtc, utc=True, errors="coerce")
+    expected = raw.where(raw.ne(0), len(target) + 1)
+    valid = (raw.notna() & np.isfinite(raw) & raw.between(0, len(target)) & raw.eq(raw.round())
+             & effective.notna() & np.isfinite(effective) & effective.eq(expected)
+             & target.grid_position_is_missing.eq(0) & target.grid_is_quali_proxy.eq(0)
+             & published.notna() & used.eq(published) & cutoff.notna()
+             & published.le(source_time) & published.lt(cutoff))
+    if target.empty or target.Abbreviation.isna().any() or target.Abbreviation.duplicated().any() or not valid.all():
+        entrants = target.loc[~valid, "Abbreviation"].astype(str).tolist()
+        raise ValueError("official_grid requires an explicit GridPosition and eligible GridPublishedAt "
+                         "for ALL target entrants, with no proxy/imputed grid, effective positions matching "
+                         "the published grid, and publication <= source_published_at_utc and < FeatureCutoffUtc; "
+                         f"invalid entrants: {entrants or 'missing or duplicate entrants'}")
+
+
+def _archive_live_forecast(predictions, target, metadata, stem, stage):
+    generated = pd.to_datetime(metadata["prediction_generated_at_utc"], utc=True)
+    if metadata["variation_measured"] or generated >= pd.to_datetime(target.SessionStartUtc, utc=True).min():
+        return None
+    if pd.to_datetime(metadata["training_end_utc"], utc=True) >= generated:
+        raise ValueError("A live forecast cannot use training observations from after its generation time")
+    archive = PREDICTIONS_DATA_DIR / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    stamp = generated.strftime("%Y%m%dT%H%M%S%fZ")
+    path = archive / f"predictions_{stem}_{stage}_{stamp}.parquet"
+    with path.open("xb") as stream:
+        predictions.to_parquet(stream, index=False)
+    return path
 
 
 @observe("ml.evaluate")
@@ -436,13 +494,25 @@ def _evaluate(features, session, year, target_round, stage, seed=42, n_simulatio
 def run_pipeline(session, year, event, measure_variation=False, *, stage="post_quali",
                  skip_collection=False, action="auto", model_path=None, n_simulations=20000,
                  seed=42, scenario="standard_dry", events_per_season=DEFAULT_EVENTS_PER_SEASON,
-                 similar_circuits=None, strength_model="legacy"):
+                 similar_circuits=None, strength_model="legacy", forecast_phase=None,
+                 source_published_at_utc=None):
     from src.models.race_model import STRENGTH_MODELS
 
     if strength_model not in STRENGTH_MODELS:
         raise ValueError(f"Unknown strength model {strength_model!r}; choose {STRENGTH_MODELS}")
     if n_simulations <= 0:
         raise ValueError("n_simulations must be positive.")
+    if forecast_phase is not None or source_published_at_utc is not None:
+        if forecast_phase not in {"post_quali", "official_grid"} or stage != "post_quali":
+            raise ValueError("Scheduled forecast phases require stage=post_quali")
+        if source_published_at_utc is None:
+            raise ValueError("Scheduled forecast phases require a confirmed publication timestamp")
+        source_time = pd.Timestamp(source_published_at_utc)
+        if pd.isna(source_time) or source_time.tzinfo is None:
+            raise ValueError("Publication timestamp requires an explicit timezone")
+        source_time = source_time.tz_convert("UTC")
+        if source_time > pd.Timestamp.now(tz="UTC"):
+            raise ValueError("Publication timestamp cannot be in the future")
     feature_path = ensure_processed_data(session, year, event, stage, skip_collection,
                                         events_per_season, similar_circuits)
     features = pd.read_parquet(feature_path)
@@ -451,6 +521,12 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
         raise ValueError("Feature validation failed: " + "; ".join(errors))
     target_round, event_name = _resolve_target_event(year, event)
     target = _select_target_event(features, year, target_round, event_name, session)
+    if forecast_phase is not None:
+        target_start = pd.to_datetime(target.SessionStartUtc, utc=True).min()
+        if source_time >= target_start or pd.Timestamp.now(tz="UTC") >= target_start:
+            raise ValueError("Scheduled forecasts must run before the target session starts")
+        if forecast_phase == "official_grid":
+            _validate_official_grid(target, source_time)
     if action == "evaluate":
         cutoff = pd.to_datetime(target.SessionStartUtc, utc=True).min()
         return _evaluate(features.loc[pd.to_datetime(features.SessionStartUtc, utc=True) <= cutoff],
@@ -478,6 +554,8 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
     run_metadata = {"session": session, "year": year, "round_number": target_round,
                     "event_name": event_name, "prediction_generated_at_utc": pd.Timestamp.now(tz="UTC"),
                     "variation_measured": measure_variation, "stage": stage,
+                    "forecast_phase": forecast_phase or "manual",
+                    "source_published_at_utc": source_published_at_utc,
                     "strength_model": strength_model,
                     "model_version": metadata.get("model_version", "held_out_" + _training_hash(training)[:12]),
                     "training_start_utc": str(training.SessionStartUtc.min()),
@@ -485,7 +563,14 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
                     "training_races": len(training[["Year", "RoundNumber"]].drop_duplicates()),
                     "scenario": scenario, "simulation_count": n_simulations, "seed": seed,
                     "events_per_season_cap": events_per_season,
-                    "history_scope": "available_collected_sessions_not_full_championship"}
+                    "history_scope": "available_collected_sessions_not_verified_complete",
+                    "recent_results_policy": "current_previous_season_full_calendar_results_only",
+                    "calibration_oof_races": metadata.get("calibration_provenance", {}).get("n_races", 0),
+                    "calibration_races": metadata.get("calibration_provenance", {}).get("n_races", 0),
+                    "calibration_objective": metadata.get("calibration_provenance", {}).get("objective", "unknown"),
+                    "recency_policy": metadata.get("recency_policy", "unknown"),
+                    "model_limitations": metadata.get("limitations", "No demonstrated out-of-sample skill"),
+                    "library_versions": json.dumps(metadata.get("library_versions", {}), sort_keys=True)}
     summary = None
     if measure_variation:
         predictions, summary = _measure_prediction_variation(predictions, target)
@@ -497,6 +582,7 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
         stem += "_" + strength_model
     predictions.to_parquet(PREDICTIONS_DATA_DIR / f"predictions_{stem}_{stage}.parquet", index=False)
     predictions.to_parquet(PREDICTIONS_DATA_DIR / f"predictions_{stem}.parquet", index=False)
+    _archive_live_forecast(predictions, target, run_metadata, stem, stage)
     if summary is not None:
         pd.DataFrame([{**run_metadata, **summary}]).to_parquet(
             PREDICTIONS_DATA_DIR / f"variation_{stem}_{stage}.parquet", index=False)
@@ -528,6 +614,9 @@ def main(argv=None):
     parser.add_argument("--n-simulations", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--scenario", default="standard_dry")
+    parser.add_argument("--forecast-phase", choices=["post_quali", "official_grid"])
+    parser.add_argument("--source-published-at-utc",
+                        help="Confirmed qualifying-completion or official-grid publication timestamp")
     parser.add_argument("--events-per-season", type=int, default=DEFAULT_EVENTS_PER_SEASON,
                         help="Maximum collected weekends per season, including the target (default: 6)")
     parser.add_argument("--similar-circuits", nargs="*", default=None,
@@ -545,6 +634,9 @@ def main(argv=None):
                    model_path=args.model_path, n_simulations=args.n_simulations, seed=args.seed,
                    scenario=args.scenario, events_per_season=args.events_per_season,
                    similar_circuits=args.similar_circuits, strength_model=args.strength_model)
+    if args.forecast_phase is not None or args.source_published_at_utc is not None:
+        options.update(forecast_phase=args.forecast_phase,
+                       source_published_at_utc=args.source_published_at_utc)
     return run_pipeline(args.session, args.year, args.event, measure_variation=args.measure_variation, **options)
 
 

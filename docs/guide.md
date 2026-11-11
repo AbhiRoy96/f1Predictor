@@ -1,4 +1,7 @@
-# F1 Race Intelligence User and Architecture Guide
+---
+title: Gridcast user and architecture guide
+description: Forecasting workflows, application architecture, and hosting safeguards.
+---
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
@@ -216,7 +219,7 @@ Prediction stages enforce strict temporal filtering to prevent future-data conta
 | `--n-simulations` | `20000` | Number of Monte Carlo race simulations (higher values reduce MCSE). |
 | `--seed` | `42` | Random seed ensuring deterministic, reproducible simulations. |
 | `--scenario` | `standard_dry` | Counterfactual sensitivity scenario. |
-| `--events-per-season` | `6` | Maximum historical rounds collected per past season. |
+| `--events-per-season` | `6` | Detailed historical-weekend budget; recent results-only coverage is collected separately. |
 | `--similar-circuits` | Built-in | Custom list of circuit names for historical data inclusion. |
 | `--measure-variation` | `False` | Backtests completed target event, generating predicted-vs-actual residuals. |
 
@@ -242,7 +245,10 @@ python main.py predict race 2026 "Brazilian Grand Prix" --scenario wet_chaos --s
 
 ### Bounded Target Collection
 
-To optimize network bandwidth and compute efficiency, the CLI collects at most a bounded budget of relevant historical weekends (default: 6 per season) from 2021 to the target season. Event selection prioritization:
+The CLI collects complete elapsed results-only coverage for the target and previous
+season without downloading laps for every event. Detailed session collection for
+older seasons remains bounded (default: six relevant weekends per season from 2021).
+Event selection prioritization for that detailed collection:
 
 1. **Target Event**: Exact match by name or normalized circuit key.
 2. **Preceding Events**: Immediate chronological predecessors in the championship calendar.
@@ -325,7 +331,7 @@ For normalized Bayesian latent strength $b$ and XGBoost strength $x$, the combin
 
 $$s = w \cdot b + (1 - w) \cdot x$$
 
-* **Out-of-Fold (OOF) Calibration**: Training splits evaluate past-only cross-validation folds. Weight parameter $w \in [0, 1]$ is optimized via bounded search minimizing win and podium log-loss.
+* **Out-of-Fold (OOF) Calibration**: Training splits evaluate past-only cross-validation folds. The conditional top-10 Plackett-Luce ranking objective calibrates ensemble weights and temperature using finishers, while retirement risk is modeled separately.
 * **Temperature Scaling**: Calibrates final probability sharpness against historical empirical frequencies using an expanding historical window.
 
 ---
@@ -374,6 +380,67 @@ python main.py evaluate race 2026 "Brazilian Grand Prix" --strength-model legacy
 
 ---
 
+### Locked model-readiness experiments
+
+Feature recency and form use calendar-time windows rather than treating every
+collected race as equally spaced. Ordinary evaluation now records paired
+model-minus-grid and model-minus-past-selected-best-baseline intervals in the
+confidence report. The Model Lab displays these intervals without claiming
+an improvement when the interval crosses zero or evidence is missing.
+
+Choose a genuine cutoff and validation start before tuning. The following
+PowerShell workflow locks feature data, code and runtime versions, compares
+12/18/24/36-month and all-history windows on common validation races, and
+reserves the final test for one execution:
+
+```powershell
+$py = ".venv\Scripts\python.exe"
+& $py -m scripts.model_readiness lock --features data\processed\race_post_quali_features.parquet --lock reports\readiness-lock.json --cutoff $cutoff --validation-start $validationStart
+& $py -m scripts.model_readiness ablate --lock reports\readiness-lock.json --output reports\window-ablation
+& $py -m scripts.model_readiness final-test --lock reports\readiness-lock.json --output reports\final-test
+```
+
+Set `$cutoff` and `$validationStart` to your selected timezone-aware timestamps.
+Do not treat an ordinary exploratory `evaluate` run as the locked final test.
+A failed final-test execution still consumes the reservation; investigate it
+without silently reusing the held-out sample for tuning.
+
+Model artifacts record exact Python and package versions. Loading an artifact
+with missing or incompatible metadata raises an explicit retraining error.
+Joblib files remain trusted-code artifacts; never load user-supplied models.
+
+### Scheduled and prospective forecasts
+
+Scheduled forecasts submit to the existing protected queue, not a second disk-writing
+worker. Set `BACKEND_URL` to the internal API and obtain `PROXY_AUTH_TOKEN` from
+Key Vault. The following commands require actual observed publication times:
+
+```powershell
+& $py -m scripts.scheduled_forecast --year $year --event $event --phase post_quali --qualifying-completed-at $qCompleted --race-start $raceStart
+& $py -m scripts.scheduled_forecast --year $year --event $event --phase official_grid --qualifying-completed-at $qCompleted --race-start $raceStart --grid-published-at $gridPublished
+```
+
+Both phases use `stage=post_quali`, but persist distinct `forecast_phase` and
+`source_published_at_utc` values. Queue admission validates the phase and timezone;
+the pipeline also checks publication and forecast timing against the target start.
+The operator must supply genuine qualifying/grid publication observations;
+cron scheduling alone does not discover official penalties.
+The official-grid phase requires explicit eligible grid positions and publication
+provenance for every entrant. Missing/imputed positions or qualifying proxies
+are rejected before training rather than mislabeled as post-penalty evidence.
+
+Pre-race forecasts automatically create immutable archive files. Score these only
+after completed classifications become available:
+
+```powershell
+$forecasts = (Get-ChildItem data\predictions\archive\*.parquet).FullName
+& $py -m scripts.live_scoreboard --forecasts $forecasts --results data\raw\2026_r_results.parquet --output reports\live-scoreboard.csv
+```
+
+These commands have not been run against live data as part of the repository
+implementation. A real collection, window ablation, locked test, evaluation
+reference and prospective scoreboard remain launch requirements.
+
 ### Single-Event Backtesting
 
 Generate predicted-vs-actual residuals on a completed historical event without modifying serialized production models:
@@ -409,6 +476,42 @@ The backend (`backend/`) manages database persistence, API routing, and asynchro
 * **Advisory Lock Concurrency**: A PostgreSQL advisory lock ensures a single worker process handles disk-bound model and Parquet updates, preventing file corruption.
 * **Idempotency**: Data imports and season syncs can be executed repeatedly without generating duplicate records.
 
+### Hosted queue safeguards
+
+The web proxy and API accept at most 16 KiB per JSON request. Hosted API requests
+require the shared `PROXY_AUTH_TOKEN` and a pseudonymous user supplied by the
+authenticated web proxy. Set `HOSTED_MODE=true` on both applications and keep the
+API ingress internal. Header checks alone are not authentication: ACA must enforce
+Microsoft Entra sign-in and replace client principal headers before web ingress.
+
+The queue admits at most three active jobs per user and ten globally. Predictions
+are limited to 50,000 simulations and twelve detailed weekends per older season.
+Duplicate active forecasts reuse the existing job for the same user; another user's
+active duplicate is rejected. Successful identical requests are reused for one hour.
+The identity includes year, event, session, stage, strength model and seed.
+Changing only simulation count or collection options does not create an active duplicate.
+
+Season sync is single-flight across the queue, with a one-hour interval per season.
+Upstream requests are spaced by one second and retry transient failures with
+exponential backoff and `Retry-After`. Database-backed write throttles permit
+twenty requests per minute per user and client-address pseudonym across API replicas.
+Job listings expose only the current user's jobs; forecasts and settings are shared.
+
+The worker holds its session advisory lock on a direct PostgreSQL connection on
+port 5432. Each production job runs in a bounded subprocess with a heartbeat;
+`JOB_MAX_RUNTIME_SECONDS` defaults to 3600 and `JOB_HEARTBEAT_SECONDS` to 15.
+On Linux, timeout or loss of the worker lock terminates the entire job process group.
+Interrupted jobs fail visibly and are not silently retried.
+
+Run schema v3 migrations only through `db-init`, before deploying API and worker
+images. Existing jobs without an owner remain administrative records and are not
+shown in user job lists. `pg_stat_statements` is optional: configure it on the server
+and set `ENABLE_PG_STAT_STATEMENTS=true` on the init job if database profiling is needed.
+Application startup never applies migrations.
+
+See the [ACA hosting checklist](patch/f1_predictor_aca_hosting_checklist.md)
+for infrastructure entry points and the cloud-only launch checks.
+
 ---
 
 ### Championship Synchronization
@@ -416,8 +519,8 @@ The backend (`backend/`) manages database persistence, API routing, and asynchro
 Synchronize official championship standings and historical session classifications from Jolpica:
 
 ```bash
-# Sync entire season calendar and standings
-docker compose exec api flask --app backend.app:create_app sync-season 2024
+# Local same-origin proxy; hosted use requires your signed-in browser
+curl -X POST http://localhost:3000/api/seasons/2024/sync -H "Content-Type: application/json" -d "{}"
 ```
 
 ---
@@ -456,6 +559,8 @@ npm run dev
 * **`/seasons`**: Official championship calendars, session classifications, and driver/constructor standings.
 * **`/model-lab`**: Interactive walk-forward evaluation dashboards, Brier score leaderboards, and reliability diagrams.
 * **`/settings`**: Configure default simulation parameters, collection budgets, and active model variants.
+* **`/privacy`**: Stored data, pseudonymous admission identities and retention responsibilities.
+* **`/health`**: Lightweight web probe. API readiness separately checks PostgreSQL.
 
 ---
 
@@ -597,6 +702,15 @@ npm run build
 * **[FIA](https://www.fia.com/) & [Formula 1](https://www.formula1.com/)**: Official sporting regulations, entry lists, and race classifications.
 * **[Jolpica F1 API](https://github.com/jolpica/jolpica-f1)**: Ergast-compatible championship standings and historical results.
 * **[OpenTelemetry](https://opentelemetry.io/) & [Grafana](https://grafana.com/)**: Application and model observability instrumentation.
+
+The MIT licence covers application code, not upstream datasets. Jolpica's
+[terms of use](https://github.com/jolpica/jolpica-f1/blob/main/TERMS.md)
+specify non-commercial use under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/);
+commercial use requires contacting the provider. The UI provides attribution and
+an unofficial-project disclaimer and uses the bundled Noto Sans font, not a
+proprietary Formula 1 font. These changes do not grant rights to timing data or
+trademarks. Operator review of the intended public/commercial use remains required.
 
 ---
 *For further technical inquiries, review [CONTRIBUTING.md](../CONTRIBUTING.md) and [SECURITY.md](../SECURITY.md).*

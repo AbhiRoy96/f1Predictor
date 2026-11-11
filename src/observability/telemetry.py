@@ -23,6 +23,8 @@ def configure(service_name: str) -> bool:
     operations.compute_rate()
     if os.getenv("OTEL_ENABLED", "false").lower() != "true":
         return False
+    if os.getenv("HOSTED_MODE") == "true" and not os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        raise RuntimeError("Hosted telemetry requires an explicit controlled OTLP endpoint.")
     if _initialized:
         return True
     from opentelemetry._logs import set_logger_provider

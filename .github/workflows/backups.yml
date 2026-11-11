@@ -1,0 +1,61 @@
+name: Azure Files snapshots
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 3 * * *'
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: gridcast-aca-staging
+  cancel-in-progress: false
+jobs:
+  snapshots:
+    if: vars.AZURE_BACKUPS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+      RETENTION_DAYS: ${{ vars.AZURE_SNAPSHOT_RETENTION_DAYS || '14' }}
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - shell: pwsh
+        run: |
+          $snapshots = foreach ($share in @('data', 'models', 'reports')) {
+            $result = az storage share-rm snapshot -g $env:RESOURCE_GROUP `
+              --storage-account $env:STORAGE_ACCOUNT --name $share `
+              --metadata gridcast_backup=true --output json
+            if ($LASTEXITCODE) { throw "Snapshot failed for $share." }
+            $result | ConvertFrom-Json -DateKind String
+          }
+          $snapshots | ConvertTo-Json -Depth 10 | Set-Content "$env:RUNNER_TEMP/snapshots.json"
+          $days = 0
+          if (-not [int]::TryParse($env:RETENTION_DAYS, [ref]$days) -or $days -lt 7 -or $days -gt 90) {
+            throw 'Snapshot retention must be an integer from seven to ninety days.'
+          }
+          $existing = az storage share-rm list -g $env:RESOURCE_GROUP `
+            --storage-account $env:STORAGE_ACCOUNT --include-snapshot --output json
+          if ($LASTEXITCODE) { throw 'Could not list snapshots for retention.' }
+          foreach ($item in ($existing | ConvertFrom-Json -DateKind String)) {
+            $time = $item.snapshotTime
+            $metadata = $item.metadata
+            if (-not $time) { $time = $item.properties.snapshotTime }
+            if (-not $metadata) { $metadata = $item.properties.metadata }
+            if ($metadata.gridcast_backup -ne 'true') { continue }
+            if (-not $time) { throw 'Marked backup has no snapshot timestamp; refusing deletion.' }
+            if ($item.name -notin @('data', 'models', 'reports')) { continue }
+            if ([datetimeoffset]::Parse($time) -ge [datetimeoffset]::UtcNow.AddDays(-$days)) { continue }
+            az storage share-rm delete -g $env:RESOURCE_GROUP --storage-account $env:STORAGE_ACCOUNT `
+              --name $item.name --snapshot $time --yes
+            if ($LASTEXITCODE) { throw 'Snapshot retention deletion failed.' }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: share-snapshots
+          path: ${{ runner.temp }}/snapshots.json
+          retention-days: 30

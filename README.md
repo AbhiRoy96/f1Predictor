@@ -1,4 +1,7 @@
-# F1 Race Intelligence & Prediction (Gridcast)
+---
+title: Gridcast
+description: Point-in-time race forecasting and an authenticated analytical workspace.
+---
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -74,6 +77,13 @@ Launch Gridcast (Next.js), the Flask API, PostgreSQL, and Grafana in containeriz
 > [!IMPORTANT]
 > This setup is designed for private, local analytical use. Published services bind to `localhost` and Grafana defaults to anonymous admin access. Do not expose without implementing network authentication and access controls.
 
+For Azure hosting, use the [Azure deployment and release guide](infra/azure/README.md),
+[ACA readiness checklist](docs/patch/f1_predictor_aca_hosting_checklist.md)
+and [hosted queue safeguards](docs/guide.md#hosted-queue-safeguards).
+Cloud templates do not replace staging verification or model-readiness evidence.
+Jolpica data has [separate non-commercial terms](https://github.com/jolpica/jolpica-f1/blob/main/TERMS.md);
+the MIT licence applies to application code.
+
 ---
 
 ## Repository Layout
@@ -92,7 +102,7 @@ src/                 Core Python forecasting and modeling engine
   visualization/     Circuit mapping and telemetry plotting helpers
 scripts/             Feature auditing, benchmarking, and web export scripts
 tests/               Comprehensive unit, integration, and regression test suites
-infra/               Observability configs (Prometheus, Grafana, OpenTelemetry)
+infra/               Azure hosting templates and local observability configs
 docs/                Comprehensive user guides, architecture specs, and archives
 data/                Locally cached telemetry and dataset storage (git-ignored)
 models/              Serialized trained model artifacts (git-ignored)

@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import joblib
+from src.models.artifacts import dump_artifact
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
@@ -189,7 +189,7 @@ def train_and_save_winner_models(
 
     # 3. Save serialized model & artifacts
     model_save_path = output_dir / "winner_ensemble.joblib"
-    joblib.dump(
+    dump_artifact(
         {
             "model": ensemble,
             "feature_columns": feature_cols,

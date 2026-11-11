@@ -2,6 +2,8 @@ import "server-only";
 
 import { context, metrics, propagation, trace, SpanStatusCode } from "@opentelemetry/api";
 import { logs, SeverityNumber } from "@opentelemetry/api-logs";
+import { headers as requestHeaders } from "next/headers";
+import { hostedHeaders } from "./hosted-auth";
 
 export async function backendRequest(resource: string, init: RequestInit = {}): Promise<Response> {
   const operation = resource.split("/")[0];
@@ -11,6 +13,7 @@ export async function backendRequest(resource: string, init: RequestInit = {}): 
     propagation.inject(context.active(), headers);
     let status = "failed";
     try {
+      Object.assign(headers, hostedHeaders(await requestHeaders()));
       const base = process.env.BACKEND_URL ?? "http://127.0.0.1:5000";
       const response = await fetch(`${base}/api/${resource}`, {
         ...init, headers, cache: "no-store", signal: AbortSignal.timeout(20000),

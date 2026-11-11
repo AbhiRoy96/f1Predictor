@@ -6,3 +6,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*.local.parameters.json
+release-state.json
+rollback-state.json
+infra/azure/*.arm.json

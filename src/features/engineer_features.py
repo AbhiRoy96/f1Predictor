@@ -387,23 +387,32 @@ class _HistoryIndex:
                   _collision=("_collision", "mean"))
         eligible["_era"] = np.select([eligible.Year.ge(2026), eligible.Year.ge(2022)], [2026, 2022], default=2014)
         self.groups = {}
+        self.form_groups = {}
         for dimension in (None, "Year", "CircuitName", "_era"):
             keys = [self.entity, "_category"] + ([dimension] if dimension else [])
             for key, group in eligible.groupby(keys, dropna=False):
                 group = group.sort_values("SessionStartUtc")
+                if dimension == "_era":
+                    self.form_groups[key] = (
+                        group["SessionStartUtc"].dt.as_unit("ns").astype("int64").to_numpy(),
+                        group["Position"].to_numpy(float), group["Points"].fillna(0).to_numpy(float))
                 stats = pd.DataFrame(index=group.index)
                 stats["count"] = np.arange(1, len(group) + 1)
                 for column in ("Points", "_winner", "_podium"):
                     stats[column] = group[column].fillna(0).cumsum()
                 stats["position"] = group["Position"].expanding().mean()
-                stats["form_3"] = group["Position"].rolling(3, min_periods=1).mean()
-                stats["form_5"] = group["Position"].rolling(5, min_periods=1).mean()
-                stats["points_5"] = group["Points"].rolling(5, min_periods=1).sum()
-                stats["ewma_position"] = group["Position"].ewm(halflife=5).mean()
-                stats["ewma_points"] = group["Points"].ewm(halflife=5).mean()
+                dated = group.set_index("SessionStartUtc")
+                stats["form_3"] = dated["Position"].rolling("90D", min_periods=1).mean().to_numpy()
+                stats["form_5"] = dated["Position"].rolling("180D", min_periods=1).mean().to_numpy()
+                stats["points_5"] = dated["Points"].rolling("180D", min_periods=1).sum().to_numpy()
+                stats["ewma_position"] = group["Position"].ewm(
+                    halflife="90D", times=group["SessionStartUtc"]).mean()
+                stats["ewma_points"] = group["Points"].ewm(
+                    halflife="90D", times=group["SessionStartUtc"]).mean()
                 if not team:
                     grid = group["GridPosition"].where(group["GridPosition"].gt(0))
-                    stats["finish_vs_grid"] = (group["Position"] - grid).ewm(halflife=5).mean()
+                    stats["finish_vs_grid"] = (group["Position"] - grid).ewm(
+                        halflife="90D", times=group["SessionStartUtc"]).mean()
                     stats["position_change"] = (group["Position"] - grid).abs().expanding().mean()
                 for column in ("_dnf", "_mechanical", "_collision"):
                     stats[column] = group[column].fillna(0).cumsum()
@@ -447,6 +456,23 @@ class _HistoryIndex:
                 stats.get("Points", 0) / stats["count"] if stats.get("count", 0) else np.nan)
         for metric in ("form_3", "form_5", "points_5", "ewma_position", "ewma_points"):
             features[prefix + metric] = era_stats.get(metric, np.nan if metric != "points_5" else 0)
+        indexed = self.form_groups.get((entity, category, era))
+        if indexed is not None:
+            times, positions, points = indexed
+            end = times.searchsorted(cutoff.value, side="left")
+            for days, legacy_name in ((90, "form_3"), (180, "form_5")):
+                start = times.searchsorted((cutoff - pd.Timedelta(days=days)).value, side="left")
+                values = positions[start:end]
+                mean = float(values.mean()) if len(values) else np.nan
+                features[prefix + legacy_name] = mean
+                features[prefix + f"form_{days}d"] = mean
+                if days == 180:
+                    features[prefix + "points_5"] = float(points[start:end].sum())
+                    features[prefix + "points_180d"] = float(points[start:end].sum())
+        else:
+            features[prefix + "form_90d"] = np.nan
+            features[prefix + "form_180d"] = np.nan
+            features[prefix + "points_180d"] = 0.0
         if not self.team:
             features[prefix + "ewma_finish_vs_grid"] = career.get("finish_vs_grid", np.nan)
             features[prefix + "position_change"] = career.get("position_change", np.nan)
@@ -664,6 +690,8 @@ def build_features(results, laps=None, weather=None, messages=None, news=None, s
                 "team_lineage": target["team_lineage"],
                 "stage": stage,
                 "FeatureCutoffUtc": target["FeatureCutoffUtc"],
+                "GridPosition": target.get("GridPosition", np.nan),
+                "GridPublishedAt": pd.to_datetime(target.get("GridPublishedAt"), utc=True, errors="coerce"),
                 "news_source_max_utc": pd.NaT,
                 "target_position": target["Position"],
                 "target_points": target["Points"],

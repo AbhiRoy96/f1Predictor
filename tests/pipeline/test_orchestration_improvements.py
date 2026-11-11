@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pandas as pd
 import joblib
+from src.models.artifacts import dump_artifact
 
 import main as pipeline
 
@@ -47,7 +48,7 @@ class OrchestrationImprovementsTests(unittest.TestCase):
             locations.append(Path(output_dir))
             self.assertEqual(pd.read_parquet(feature_path).value.tolist(), [1.0])
             model_path = Path(output_dir) / "race.joblib"
-            joblib.dump({"model": "temporary", "feature_columns": ["value"]}, model_path)
+            dump_artifact({"model": "temporary", "feature_columns": ["value"]}, model_path)
             return {"model_path": model_path}
 
         with tempfile.TemporaryDirectory() as directory:

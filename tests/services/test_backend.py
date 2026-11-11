@@ -1,6 +1,7 @@
 """API, persistence and worker contracts, with optional real PostgreSQL coverage."""
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,10 +11,19 @@ import pandas as pd
 from sqlalchemy import select
 
 from backend.app import create_app
-from backend.db import metadata, migrate, save_run, seasons, settings, upsert, utcnow
+from backend.db import (
+    jobs,
+    metadata,
+    migrate,
+    save_run,
+    seasons,
+    settings,
+    upsert,
+    utcnow,
+)
 from backend.options import DEFAULTS
 from backend.tasks import execute_job, fetch_table, import_local_data, sync_season
-from backend.worker import process_next
+from backend.worker import execute_isolated, process_next
 from scripts.export_web_data import _reports, build_demo_frame
 
 
@@ -59,12 +69,14 @@ class BackendTests(unittest.TestCase):
             restarted.extensions["db"].dispose()
 
     def test_invalid_inputs_never_enqueue(self):
+        self.app.config["WRITE_RATE_PER_MINUTE"] = 100
         bad = [
             {"year": True}, {"year": 2020}, {"year": 5000}, {"event": ""},
             {"event": "x" * 161}, {"event": ["not", "text"]}, {"n_simulations": True},
-            {"n_simulations": 99}, {"n_simulations": 100001}, {"seed": -1},
+            {"n_simulations": 99}, {"n_simulations": 50001}, {"seed": -1},
             {"session": "shell"}, {"stage": "future"}, {"strength_model": "unknown"},
-            {"events_per_season": 0}, {"skip_collection": "yes"}, {"api_key": "not-supported"},
+            {"events_per_season": 0}, {"events_per_season": 13},
+            {"skip_collection": "yes"}, {"api_key": "not-supported"},
         ]
         for data in bad:
             with self.subTest(data=data):
@@ -80,10 +92,137 @@ class BackendTests(unittest.TestCase):
     def test_queue_cap_and_sync_validation(self):
         self.assertEqual(self.client.post("/api/seasons/2026/sync", json={"unknown": 1}).status_code, 400)
         self.assertEqual(self.client.post("/api/seasons/1900/sync", json={}).status_code, 400)
-        for _ in range(10):
-            self.assertEqual(self.submit().status_code, 202)
-        self.assertEqual(self.submit().status_code, 429)
+        for seed in range(3):
+            self.assertEqual(self.submit(seed=seed).status_code, 202)
+        self.assertEqual(self.submit(seed=3).status_code, 429)
         self.assertEqual(self.client.post("/api/seasons/2026/sync", json={}).status_code, 429)
+
+    def test_global_queue_cap(self):
+        self.app.config["USER_QUEUE_LIMIT"] = 20
+        for seed in range(10):
+            self.assertEqual(self.submit(seed=seed).status_code, 202)
+        self.assertEqual(self.submit(seed=10).status_code, 429)
+
+    def test_duplicates_and_fresh_runs_are_reused(self):
+        response = self.submit()
+        self.assertEqual(self.submit(n_simulations=1000).json["id"], response.json["id"])
+        with patch("backend.worker.execute_job", return_value="saved"):
+            process_next(self.engine)
+        reused = self.submit()
+        self.assertEqual(reused.status_code, 200)
+        self.assertEqual(reused.json["run_id"], "saved")
+        self.assertTrue(reused.json["reused"])
+        self.assertEqual(self.submit(n_simulations=1000).status_code, 202)
+
+    def test_scheduled_phases_are_validated_and_distinct(self):
+        publication = "2026-01-01T10:00:00Z"
+        for data in (
+            {"forecast_phase": "official_grid"},
+            {"source_published_at_utc": publication},
+            {"forecast_phase": "unverified", "source_published_at_utc": publication},
+            {"forecast_phase": "post_quali", "source_published_at_utc": "2026-01-01"},
+            {"forecast_phase": "post_quali", "source_published_at_utc": "2999-01-01T00:00:00Z"},
+            {"forecast_phase": "post_quali", "source_published_at_utc": publication, "stage": "pre_weekend"},
+        ):
+            self.assertEqual(self.submit(**data).status_code, 400)
+        quali = self.submit(forecast_phase="post_quali", source_published_at_utc=publication)
+        grid = self.submit(forecast_phase="official_grid", source_published_at_utc=publication)
+        self.assertEqual((quali.status_code, grid.status_code), (202, 202))
+        self.assertNotEqual(quali.json["id"], grid.json["id"])
+        repeat = self.submit(forecast_phase="official_grid", source_published_at_utc="2026-01-01T10:01:00Z")
+        self.assertEqual(repeat.json["id"], grid.json["id"])
+        row = self.client.get(f"/api/jobs/{grid.json['id']}").json
+        self.assertEqual(row["payload"]["source_published_at_utc"], "2026-01-01T10:00:00+00:00")
+
+    def test_sync_is_single_flight_and_has_cooldown(self):
+        first = self.client.post("/api/seasons/2026/sync", json={})
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(self.client.post("/api/seasons/2026/sync", json={}).json["id"], first.json["id"])
+        self.assertEqual(self.client.post("/api/seasons/2025/sync", json={}).status_code, 429)
+        with patch("backend.worker.execute_job", side_effect=ValueError("provider down")):
+            process_next(self.engine)
+        self.assertEqual(self.client.post("/api/seasons/2026/sync", json={}).status_code, 429)
+
+    def test_hosted_auth_identity_and_rate_limit(self):
+        self.app.config.update(HOSTED_MODE=True, PROXY_AUTH_TOKEN="t" * 32, WRITE_RATE_PER_MINUTE=2)
+        self.assertEqual(self.client.get("/api/jobs").status_code, 401)
+        self.assertEqual(self.client.get("/api/health").status_code, 200)
+        headers = {"X-Gridcast-Proxy-Token": "t" * 32, "X-Gridcast-User": "a" * 64}
+        response = self.client.post("/api/predictions", json={"year": 2026, "event": "Test"}, headers=headers)
+        self.assertEqual(response.status_code, 202)
+        other = headers | {"X-Gridcast-User": "b" * 64}
+        self.assertEqual(self.client.get(f"/api/jobs/{response.json['id']}", headers=other).status_code, 404)
+        for expected in (200, 429):
+            self.assertEqual(self.client.put("/api/settings", json=DEFAULTS, headers=headers).status_code, expected)
+
+    def test_body_limit_and_worker_timeout(self):
+        self.assertEqual(self.client.post("/api/predictions", json={"event": "x" * 17000}).status_code, 413)
+        job_id = self.submit().json["id"]
+        process = Mock()
+        process.poll.side_effect = [None, None]
+        with patch("backend.worker.subprocess.Popen", return_value=process), patch(
+                "backend.worker.time.monotonic", side_effect=[0, 3601]), patch(
+                "backend.worker.os.killpg", create=True) as kill_group:
+            self.assertTrue(process_next(self.engine, executor=execute_isolated))
+        if os.name == "posix":
+            kill_group.assert_called_once()
+        else:
+            process.terminate.assert_called_once()
+        row = self.client.get(f"/api/jobs/{job_id}").json
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("maximum runtime", row["error"])
+        self.assertIsNotNone(row["heartbeat_at"])
+
+    def test_subprocess_failure_is_not_reported_as_success(self):
+        job_id = self.submit().json["id"]
+        process = Mock(returncode=1)
+        process.poll.return_value = 1
+        with patch("backend.worker.subprocess.Popen", return_value=process):
+            process_next(self.engine, executor=execute_isolated)
+        row = self.client.get(f"/api/jobs/{job_id}").json
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("exited with code 1", row["error"])
+
+    def test_real_job_subprocess_reads_claimed_job_and_persists_failure(self):
+        job_id = self.submit().json["id"]
+        with self.engine.begin() as connection:
+            connection.execute(jobs.update().where(jobs.c.id == job_id).values(kind="invalid"))
+        with patch.dict(os.environ, {"DATABASE_URL": self.url, "OTEL_ENABLED": "false",
+                                    "JOB_MAX_RUNTIME_SECONDS": "30"}):
+            self.assertTrue(process_next(self.engine, executor=execute_isolated))
+        row = self.client.get(f"/api/jobs/{job_id}").json
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNotNone(row["heartbeat_at"])
+        self.assertIsNotNone(row["finished_at"])
+
+    def test_worker_stops_subprocess_if_lock_heartbeat_fails(self):
+        job_id = self.submit().json["id"]
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("job", 10), 0]
+        with patch("backend.worker.subprocess.Popen", return_value=process), patch(
+                "backend.worker.os.killpg", create=True) as kill_group:
+            process_next(self.engine, executor=lambda db, job: execute_isolated(
+                db, job, heartbeat=Mock(side_effect=RuntimeError("Worker lock lost"))))
+        if os.name == "posix":
+            self.assertEqual(kill_group.call_count, 2)
+        else:
+            process.terminate.assert_called_once()
+            process.kill.assert_called_once()
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}").json["status"], "failed")
+
+    def test_upstream_retries_and_conservative_pacing(self):
+        from backend.tasks import fetch_page
+
+        with patch("backend.tasks.requests.Session") as session_type, patch("backend.tasks.time.sleep") as sleep:
+            session = session_type.return_value.__enter__.return_value
+            fetch_page("https://api.jolpi.ca/ergast/f1/2026.json", params={"limit": 100})
+        retry = session.mount.call_args.args[1].max_retries
+        self.assertEqual(retry.total, 4)
+        self.assertIn(429, retry.status_forcelist)
+        self.assertTrue(retry.respect_retry_after_header)
+        sleep.assert_called_once_with(1)
+        self.assertEqual(session.get.call_args.kwargs["timeout"], (10, 60))
 
     def test_historical_seasons_start_in_1950_without_changing_prediction_limits(self):
         response = self.client.post("/api/seasons/1950/sync", json={})
@@ -99,7 +238,7 @@ class BackendTests(unittest.TestCase):
         job = self.client.get(f"/api/jobs/{job_id}").json
         self.assertEqual((job["status"], job["run_id"]), ("succeeded", "saved-run"))
         self.assertIsNotNone(job["finished_at"])
-        failure_id = self.submit().json["id"]
+        failure_id = self.submit(seed=43).json["id"]
         with patch("backend.worker.execute_job", side_effect=ValueError("No eligible entrants")):
             self.assertTrue(process_next(self.engine))
         job = self.client.get(f"/api/jobs/{failure_id}").json
@@ -119,6 +258,21 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(len(response.json["drivers"]), 22)
         self.assertAlmostEqual(sum(row["win_probability"] for row in response.json["drivers"]), 1)
         self.assertEqual(self.client.get("/api/runs").json[0]["id"], "test-run")
+
+    def test_export_preserves_calibration_phase_and_paired_evidence(self):
+        from scripts.export_web_data import build_run
+
+        frame = build_demo_frame(n_simulations=100).assign(
+            calibration_races=12, forecast_phase="official_grid",
+            source_published_at_utc="2026-01-01T10:00:00Z")
+        paired = {"model": "ensemble", "reference": "best_baseline_difference",
+                  "metric": "win_log_loss", "estimate": -0.1, "ci_low": -0.3,
+                  "ci_high": 0.1, "n_races": 12, "block_length": 2}
+        payload = build_run(frame, "provenance", {"confidence": [paired]})
+        self.assertEqual(payload["meta"]["calibration_races"], 12)
+        self.assertEqual(payload["meta"]["forecast_phase"], "official_grid")
+        self.assertEqual(payload["meta"]["source_published_at_utc"], "2026-01-01T10:00:00Z")
+        self.assertEqual(payload["reports"]["confidence"], [paired])
 
     def test_import_order_does_not_change_forecast_chronology(self):
         for run_id, timestamp in (("newer", "2026-03-02T00:00:00Z"),
@@ -144,7 +298,7 @@ class BackendTests(unittest.TestCase):
             response.json.return_value = {"MRData": {"total": "2", "limit": "1",
                                                      "RaceTable": {"Races": [row]}}}
             responses.append(response)
-        with patch("backend.tasks.requests.get", side_effect=responses) as get:
+        with patch("backend.tasks.fetch_page", side_effect=responses) as get:
             result = fetch_table(2026, "results", "RaceTable", "Races")
         self.assertEqual([row["position"] for row in result[0]["Results"]], ["1", "2"])
         self.assertEqual(get.call_args_list[1].kwargs["params"]["offset"], 1)
@@ -162,7 +316,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/seasons/2026").json["payload"]["source"], "jolpica")
         response = Mock()
         response.json.return_value = {"MRData": {"total": "0", "limit": "100", "RaceTable": {"Races": []}}}
-        with patch("backend.tasks.requests.get", return_value=response) as get:
+        with patch("backend.tasks.fetch_page", return_value=response) as get:
             fetch_table(2026, "", "RaceTable", "Races")
         self.assertEqual(get.call_args.args[0], "https://api.jolpi.ca/ergast/f1/2026.json")
 

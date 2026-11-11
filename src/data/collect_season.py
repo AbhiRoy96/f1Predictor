@@ -1,14 +1,18 @@
 ﻿import argparse
+import os
+import time
+from email.utils import parsedate_to_datetime
 import re
 import unicodedata
 from pathlib import Path
 
 import fastf1
 import pandas as pd
+import requests
 
 from src.data import collect_driver_constructor_stats
 
-CACHE = Path("data/cache/fastf1")
+CACHE = Path(os.environ.get("FASTF1_CACHE_DIR", "data/cache/fastf1"))
 OUTPUT = Path("data/raw")
 
 _SESSION_CODES = {
@@ -35,6 +39,34 @@ def _enable_cache():
         else:
             fastf1.Cache.enable_cache(str(CACHE))
         _CACHE_ENABLED = True
+
+
+def _load_session(session, results_only):
+    """Keep FastF1's cached/rate-limited transport and pace whole-calendar loads."""
+    for attempt in range(3 if results_only else 1):
+        if results_only:
+            time.sleep(1)
+        try:
+            session.load(laps=not results_only, telemetry=False, weather=not results_only,
+                         messages=not results_only)
+            return
+        except requests.RequestException as exc:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            transient = isinstance(exc, (requests.ConnectionError, requests.Timeout)) or status in {429, 500, 502, 503, 504}
+            if not results_only or not transient or attempt == 2:
+                raise
+            delay = 2 ** attempt
+            retry_after = response.headers.get("Retry-After") if response is not None else None
+            if retry_after:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    until = pd.Timestamp(parsedate_to_datetime(retry_after))
+                    delay = max(delay, (until - pd.Timestamp.now(tz="UTC")).total_seconds())
+            if delay > 300:
+                raise RuntimeError("Upstream Retry-After exceeds this collection attempt; retry later") from exc
+            time.sleep(delay)
 
 
 def _normalize_event_identifier(value):
@@ -172,7 +204,7 @@ def _frame_from_session(session, attribute):
 
 
 def collect_event(year: int, event_name: str, event=None, now=None, raise_on_failure=False,
-                  session_types=None):
+                  session_types=None, results_only=False):
     """Collect each scheduled session independently for a single event."""
     _enable_cache()
     if event is None:
@@ -196,6 +228,8 @@ def collect_event(year: int, event_name: str, event=None, now=None, raise_on_fai
     collected = []
     failures = []
     for session_name, session_type, session_start in _session_specs(event):
+        if results_only and (session_type.startswith("FP") or pd.isna(session_start)):
+            continue
         if session_types is not None and session_type not in session_types:
             continue
         if not pd.isna(session_start) and session_start > now:
@@ -216,7 +250,7 @@ def collect_event(year: int, event_name: str, event=None, now=None, raise_on_fai
                 session = fastf1.get_session(year, session_identifier, session_type)
             except Exception:
                 session = fastf1.get_session(year, session_identifier, session_name)
-            session.load(laps=True, telemetry=False, weather=True, messages=True)
+            _load_session(session, results_only)
         except Exception as exc:
             if "does not exist for this event" in str(exc).lower():
                 print(f"Skipping non-existent session {event_name} {session_name}: {exc}")
@@ -226,11 +260,11 @@ def collect_event(year: int, event_name: str, event=None, now=None, raise_on_fai
             continue
 
         results = _with_metadata(_frame_from_session(session, "results"), metadata)
-        laps = _with_metadata(_frame_from_session(session, "laps"), metadata)
-        weather = _with_metadata(_frame_from_session(session, "weather_data"), metadata)
+        laps = None if results_only else _with_metadata(_frame_from_session(session, "laps"), metadata)
+        weather = None if results_only else _with_metadata(_frame_from_session(session, "weather_data"), metadata)
         messages = _with_metadata(
             _frame_from_session(session, "race_control_messages"), metadata
-        )
+        ) if not results_only else None
 
         if (results is None or results.empty) and (laps is None or laps.empty):
             failures.append(f"{session_name}: no results or lap data returned")
@@ -268,7 +302,7 @@ def collect_event(year: int, event_name: str, event=None, now=None, raise_on_fai
     return collected
 
 
-def collect_season(year: int):
+def collect_season(year: int, results_only=False, now=None):
     """Collect every scheduled practice, qualifying, sprint, and race session."""
     _enable_cache()
     schedule = fastf1.get_event_schedule(year, include_testing=False)
@@ -283,7 +317,8 @@ def collect_season(year: int):
         event_name = event["EventName"]
         print(f"Collecting {year}: {event_name}")
         try:
-            collect_event(year, event_name, event=event, raise_on_failure=True)
+            collect_event(year, event_name, event=event, raise_on_failure=True,
+                          results_only=results_only, now=now)
         except Exception as exc:
             if "does not exist for this event" in str(exc).lower():
                 print(f"Ignoring non-existent session in {year} {event_name}: {exc}")
@@ -321,6 +356,8 @@ def main(argv=None):
         "--event",
         help="collect only this event in each selected season",
     )
+    parser.add_argument("--results-only", action="store_true",
+                        help="All elapsed Q/SQ/S/R results, without laps, weather or messages")
     args = parser.parse_args(argv)
 
     has_start = args.start_year is not None
@@ -341,9 +378,10 @@ def main(argv=None):
     for year in years:
         try:
             if args.event:
-                collect_event(year, args.event, raise_on_failure=True)
+                options = {"results_only": True} if args.results_only else {}
+                collect_event(year, args.event, raise_on_failure=True, **options)
             else:
-                collect_season(year)
+                collect_season(year, **({"results_only": True} if args.results_only else {}))
         except Exception as exc:
             print(f"Failed to collect {year}: {exc}")
             failures.append(f"{year}: {exc}")

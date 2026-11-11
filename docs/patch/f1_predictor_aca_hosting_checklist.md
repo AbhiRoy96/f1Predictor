@@ -1,4 +1,73 @@
-# Gridcast / F1 Predictor: Pre-Hosting Checklist for Azure Container Apps (ACA)
+---
+title: Gridcast ACA hosting readiness checklist
+description: Repository implementation status and staging evidence required before launch.
+---
+
+## Repository implementation status
+
+This checklist is implemented as repository changes only. No Azure resources
+have been provisioned or changed. Unchecked launch gates below require actual
+staging, live-data, operator or legal evidence; configuration is not proof of deployment.
+
+The original assessment and deployment sketch below describe the baseline, not
+the current implementation. Use the checked launch items and implementation notes
+when reviewing the updated code. For current deployment commands, use the
+[Azure operator guide](../../infra/azure/README.md), not the historical sketch in
+section 5.
+
+- Queue admission now enforces three active jobs per user, ten globally,
+  active de-duplication, one-hour successful-result reuse, season-sync single-flight
+  and cooldown, and database-backed user/client-address write throttles.
+- Hosted requests require an Entra-authenticated web proxy and a private shared
+  credential to the internal API. The web and API cap JSON bodies at 16 KiB.
+  Production requires ACA authentication; principal headers alone are not proof of sign-in.
+- Production jobs run in killable subprocesses with a heartbeat and a one-hour
+  default deadline. The parent retains the direct PostgreSQL advisory lock.
+- The web includes a lightweight `/health` probe, provenance disclosures, a privacy
+  notice and upstream data attribution. The proprietary font rewrite is removed.
+- Recent-season results-only collection, calendar-time decay/form windows, a
+  conditional top-10 ranking calibration objective, paired past-selected-best-baseline
+  intervals and version-checked model artifacts are implemented with regression tests.
+- Offline tools lock experiment inputs, compare 12/18/24/36-month/all-history
+  windows and reserve the final test for one execution. Prospective forecasts are
+  archived immutably and can be scored after results arrive.
+- The enqueue-only scheduler records qualifying versus official-grid publication
+  phases. Official-grid forecasts reject missing, imputed or qualifying-proxy
+  grids before training. Genuine publication observations remain operator inputs.
+- Local smoke checks verified web health `200`, anonymous API rejection `401`,
+  and oversized JSON rejection `413`. Azure ingress and Entra validation remain pending.
+- Bicep templates now define private PostgreSQL, VNet-integrated ACA, worker-only
+  Azure Files, secret-scoped managed identities, Key Vault, probes, budgets and
+  bounded logging. Web ingress stays internal until Entra configuration is verified.
+- The preview-first release script stops the old worker, snapshots its shares,
+  completes the DB-init job, waits for new revisions and verifies authentication
+  before exposing web. Rollback preserves the additive schema.
+- The runtime has 79 exact, hashed dependency pins. CI includes dependency/image
+  scans and infrastructure validation. Protected manual OIDC releases build AMD64
+  images tagged by SHA; opt-in daily snapshots prune only marked, expired snapshots.
+
+See [hosted queue safeguards](../guide.md#hosted-queue-safeguards)
+for behavior, configuration and migration details.
+
+Local validation: Windows `230 passed, 1 skipped, 55 subtests passed`; a separate
+locked Linux runtime run completed `228 tests, 0 failures, 0 errors, 6 skipped`.
+The Linux run passed the
+PostgreSQL integration test against a disposable PostgreSQL 17 database; its six
+PowerShell release tests were skipped and validated separately on Windows.
+Ten offline release/retention/lock tests pass, including exact snapshot timestamp
+preservation and refusal to delete unmarked or unrelated snapshots.
+The production Next.js build and three hosted-identity tests pass.
+Both Bicep templates compile without warnings, workflow YAML parses, targeted
+Python lint passes, and Docker build configuration checks pass. The existing Linux
+runtime matches every locked package and passes `pip check`; a fresh production
+image build remains unverified because package downloads fail TLS negotiation.
+Local dependency audits remain unverified: npm's configured registry returned
+`429`, and downloading the Python audit tool failed TLS negotiation. CI scans are
+wired, not claimed clean.
+These results do not replace the live collection, experiment, Entra, mount,
+backup/restore, telemetry or rollback checks below.
+
+## Baseline assessment
 
 Scope: the `f1Predictor-dev-integration-agent` build (Next.js web, Flask API, Postgres, single prediction worker, OpenTelemetry, Python ML pipeline).
 
@@ -261,30 +330,37 @@ This is general caution, not legal advice.
 
 ## 8. Pre-launch checklist
 
+**Repository delivery (complete; not deployment evidence)**
+- [x] Private foundation and application templates compile
+- [x] Preview-first OIDC release and schema-init ordering implemented
+- [x] Worker shutdown, pre-release snapshots and fail-closed ingress gates tested offline
+- [x] Opt-in daily snapshots and bounded, marked-snapshot-only retention implemented
+- [x] Hashed runtime dependencies and dependency/image scan workflows added
+
 **Security**
 - [ ] Entra auth on web; API internal-only; unauthenticated calls rejected
-- [ ] Job caps, de-duplication and rate limits in place
+- [x] Job caps, de-duplication and rate limits in place (repository tests; staging load test pending)
 - [ ] No anonymous Grafana; telemetry points at Azure or is disabled
 - [ ] Secrets in Key Vault; no passwords in env files or images
-- [ ] Image and dependency scans in CI
+- [x] Image and dependency scan workflows in CI (successful scan evidence still required)
 
 **Reliability**
 - [ ] Worker min = max = 1, direct Postgres connection, job timeout added
 - [ ] Azure Files mount tested for write access as UID 10001; FastF1 cache behaviour tested
 - [ ] DB init job runs on deploy; Postgres backups enabled and a restore tested
-- [ ] Hashed lock file; model metadata includes library versions and loading checks them
+- [x] Hashed lock file; model metadata includes library versions and loading checks them
 - [ ] Image built for `linux/amd64`
 
 **Model**
-- [ ] Whole-season results-only collection and time-based decay implemented
+- [x] Whole-season results-only collector and time-based decay implemented (live collection remains pending)
 - [ ] Window ablation done; final test locked and evaluated once
-- [ ] Paired comparison against the best baseline; top-10 temperature objective
+- [x] Paired comparison against the past-selected best baseline and top-10 temperature objective implemented (real evaluation remains pending)
 - [ ] `evaluate` re-run and the output saved as the new reference
-- [ ] UI shows stage, history scope, calibration sample size, model version
-- [ ] Live scoreboard script and scheduled post-qualifying forecasts
+- [x] UI shows stage, history scope, calibration sample size, model version and training end date; missing evidence is explicit
+- [x] Live scoreboard script and enqueue-only scheduler implemented (live forecasts and schedules remain pending)
 
 **Legal and branding**
-- [ ] F1 font hotlink removed
+- [x] F1 font hotlink removed
 - [ ] Data terms reviewed; disclaimer added; no F1 logos
 
 **Operations**

@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional
-import joblib
+from src.models.artifacts import dump_artifact
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
@@ -60,7 +60,7 @@ def train_and_save_podium_model(
 
     # Serialize
     save_path = output_dir / "podium_model.joblib"
-    joblib.dump(
+    dump_artifact(
         {
             "model": pipeline,
             "feature_columns": feature_cols,
