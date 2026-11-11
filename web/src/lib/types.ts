@@ -76,3 +76,72 @@ export interface ManifestEntry {
   demo?: boolean | null;
   prediction_generated_at_utc?: string | null;
 }
+
+export interface PredictionOptions {
+  session: string;
+  stage: string;
+  strength_model: string;
+  n_simulations: number;
+  seed: number;
+  events_per_season: number;
+  skip_collection: boolean;
+}
+
+export interface SettingsResponse {
+  values: PredictionOptions;
+  choices: Record<"session" | "stage" | "strength_model", string[]>;
+  limits: Record<"n_simulations" | "seed" | "events_per_season", [number, number]>;
+  credentials_required: boolean;
+}
+
+export interface Job {
+  id: string;
+  kind: "prediction" | "season_sync";
+  status: "queued" | "running" | "succeeded" | "failed";
+  payload: { year: number; event?: string; session?: string };
+  created_at: string;
+  run_id: string | null;
+  error: string | null;
+}
+
+export interface SeasonRace {
+  season: string;
+  round: string;
+  raceName: string;
+  date: string;
+  Circuit: { circuitName: string; Location: { locality: string; country: string } };
+  Results?: RaceResult[];
+  SprintResults?: RaceResult[];
+}
+
+export interface RaceResult {
+  position: string;
+  points: string;
+  grid: string;
+  status: string;
+  Driver: { driverId: string; givenName: string; familyName: string };
+  Constructor: { name: string };
+}
+
+export interface Standing {
+  position: string;
+  points: string;
+  wins: string;
+  Driver?: { driverId: string; givenName: string; familyName: string };
+  Constructor?: { name: string };
+}
+
+export interface SeasonData {
+  year: number;
+  updated_at: string;
+  payload: {
+    source: string;
+    coverage: string;
+    calendar: (SeasonRace | Record<string, unknown>)[];
+    races: SeasonRace[];
+    sprints: SeasonRace[];
+    driver_standings: { round: string; DriverStandings: Standing[] }[];
+    constructor_standings: { round: string; ConstructorStandings: Standing[] }[];
+    local_results: Record<string, unknown>[];
+  };
+}

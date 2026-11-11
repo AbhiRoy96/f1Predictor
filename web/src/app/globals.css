@@ -1,10 +1,9 @@
 @import "tailwindcss";
 
-/* Optional: place licensed Formula1 Display files in web/public/fonts/ (git-ignored). Falls back to Noto Sans. */
 @font-face {
-  font-family: "Formula1 Display";
-  src: url("/fonts/Formula1-Display-Bold.woff2") format("woff2"), url("/fonts/Formula1-Display-Bold.otf") format("opentype");
-  font-weight: 800;
+  font-family: "Formula1 Bold";
+  src: url("/fonts/Formula1-Bold.woff2") format("woff2");
+  font-weight: 700;
   font-style: normal;
   font-display: swap;
 }
@@ -20,7 +19,7 @@
   --color-red-deep: #a10400;
   --color-amber: #ffb800;
   --color-teal: #00d2be;
-  --font-display: "Formula1 Display", "Noto Sans Variable", "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Formula1 Bold", "Noto Sans Variable", "Noto Sans", "Helvetica Neue", Arial, sans-serif;
   --font-sans: "Noto Sans Variable", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
 }
 
@@ -42,10 +41,11 @@ body {
 
 .display {
   font-family: var(--font-display);
-  font-weight: 800;
+  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: -0.01em;
-  font-style: italic;
+  font-style: normal;
+  font-synthesis: none;
 }
 
 .eyebrow {

@@ -127,7 +127,7 @@ export default async function LabPage(props: PageProps) {
           <Card className="p-6 text-sm text-fog">
             Reliability data is not available for the selected run. Generate it with{" "}
             <code className="rounded bg-track px-1">python main.py evaluate race 2026 &quot;Brazilian Grand Prix&quot;</code>{" "}
-            and re-export. Earlier output showed win and podium bins close to the diagonal at low probabilities; bins above
+            and re-import the saved forecast with the API container&apos;s import-data command. Earlier output showed win and podium bins close to the diagonal at low probabilities; bins above
             50% hold only about ten samples in total, so no conclusion is possible there.
           </Card>
         )}

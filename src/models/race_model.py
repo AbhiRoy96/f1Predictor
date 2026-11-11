@@ -19,6 +19,7 @@ from src.models.calibrate import fit_simulation_temperature
 from src.simulation.race_simulator import MonteCarloRaceSimulator, session_scenario
 from src.utils.config import METADATA_COLUMNS, get_feature_columns
 from src.utils.logging import setup_logger
+from src.observability.operations import observe
 
 logger = setup_logger(__name__)
 MODEL_VERSION = "race_pl_v2"
@@ -96,6 +97,7 @@ class ShrinkageDNFModel:
         column = next((c for c in columns if c in df), None)
         return df[column].fillna("Unknown").astype(str) if column else pd.Series("Unknown", index=df.index)
 
+    @observe("ml.dnf.train")
     def fit(self, df):
         total, mechanical, collision = dnf_labels(df)
         other = (total - mechanical.fillna(0) - collision.fillna(0)).clip(0, 1)
@@ -207,6 +209,7 @@ class RacePredictor:
                 training_score_scale(self._scores(df, xgb)[:, 0], df))
         return self._fit_legacy_strength(df, races)
 
+    @observe("ml.xgboost.train")
     def _fit_legacy_strength(self, df, races, include_logistic=True):
         neutral_position = float(np.median([len(rows) + 1 for rows in races]) / 2)
         imputer = NeutralRaceImputer(neutral_position)
@@ -268,6 +271,7 @@ class RacePredictor:
         scores = np.column_stack([mean / components.bayesian_scale, tree_scores])
         return scores, covariance / components.bayesian_scale**2
 
+    @observe("ml.train", billable=True)
     def fit(self, df):
         if df.empty or "target_position" not in df:
             raise ValueError("Training requires nonempty races with target_position")
@@ -410,6 +414,7 @@ class RacePredictor:
             self.metadata_["limitations"] += "; ensemble_weight_and_xgb_parameter_uncertainty_not_integrated"
         return self
 
+    @observe("ml.inference", billable=True)
     def predict(self, df, n_simulations=20000, scenario="standard_dry", seed=42):
         if not hasattr(self, "components_"):
             raise ValueError("Fit RacePredictor before predicting")

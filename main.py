@@ -25,6 +25,8 @@ from src.data.validate_data import validate_features_df
 from src.features.engineer_features import build_features, load_results
 from src.utils.config import PREDICTIONS_DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
 from src.utils.logging import setup_logger
+from src.observability.operations import observe, record_evaluation
+from src.observability.telemetry import configure
 
 logger = setup_logger("f1_orchestrator")
 HISTORICAL_START_YEAR = 2021
@@ -60,6 +62,7 @@ def _missing_sessions(year, event, now=None):
     return missing
 
 
+@observe("data.collect")
 def collect_historical_data(year: int, event: str, events_per_season=DEFAULT_EVENTS_PER_SEASON,
                             similar_circuits=None) -> None:
     """Collect only a bounded, relevant set of weekends, reusing saved sessions."""
@@ -393,6 +396,7 @@ def _validate_prediction_probabilities(predictions):
         raise ValueError("Predictions must satisfy win <= podium <= top10.")
 
 
+@observe("ml.evaluate")
 def _evaluate(features, session, year, target_round, stage, seed=42, n_simulations=20000,
               strength_model="legacy"):
     from src.models.evaluate import run_race_walk_forward
@@ -423,9 +427,12 @@ def _evaluate(features, session, year, target_round, stage, seed=42, n_simulatio
     for name in ("summary", "confidence", "reliability"):
         if name in result:
             print(f"\n{name.upper()}\n{result[name].to_string(index=False)}")
+    if "summary" in result:
+        record_evaluation(result["summary"])
     return result
 
 
+@observe("pipeline.run")
 def run_pipeline(session, year, event, measure_variation=False, *, stage="post_quali",
                  skip_collection=False, action="auto", model_path=None, n_simulations=20000,
                  seed=42, scenario="standard_dry", events_per_season=DEFAULT_EVENTS_PER_SEASON,
@@ -503,6 +510,7 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
 
 
 def main(argv=None):
+    configure("gridcast-cli")
     from src.models.race_model import DEFAULT_STRENGTH_MODEL, STRENGTH_MODELS
 
     arguments = list(sys.argv[1:] if argv is None else argv)

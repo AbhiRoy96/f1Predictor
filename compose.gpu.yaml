@@ -1,0 +1,5 @@
+services:
+  worker:
+    gpus: all
+    environment:
+      GPU_METRICS_ENABLED: "true"

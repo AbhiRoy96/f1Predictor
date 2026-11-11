@@ -1,0 +1,143 @@
+name: gridcast
+
+x-backend: &backend
+  build:
+    context: .
+    args:
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+  environment: &backend-env
+    DATABASE_URL: postgresql+psycopg://gridcast:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/gridcast
+    OTEL_ENABLED: ${OTEL_ENABLED:-true}
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+    OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    OTEL_TRACES_SAMPLER: parentbased_traceidratio
+    OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACE_SAMPLE_RATIO:-1.0}
+    PYROSCOPE_ENABLED: ${PYROSCOPE_ENABLED:-true}
+    PYROSCOPE_SERVER_ADDRESS: http://lgtm:4040
+    ML_COMPUTE_HOURLY_USD: ${ML_COMPUTE_HOURLY_USD:-}
+    GPU_METRICS_ENABLED: "false"
+  volumes:
+    - ./data:/app/data
+    - ./models:/app/models
+    - ./reports:/app/reports
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.max=1000
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+    environment:
+      POSTGRES_DB: gridcast
+      POSTGRES_USER: gridcast
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gridcast -d gridcast"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *backend
+    command: ["flask", "--app", "backend.app:create_app", "db-init"]
+    environment:
+      <<: *backend-env
+      OTEL_ENABLED: "false"
+      PYROSCOPE_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      OTEL_SERVICE_NAME: gridcast-api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      lgtm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  worker:
+    <<: *backend
+    init: true
+    environment:
+      <<: *backend-env
+      OTEL_SERVICE_NAME: gridcast-worker
+    command: ["python", "-m", "backend.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      lgtm:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  web:
+    build: ./web
+    environment:
+      BACKEND_URL: http://api:5000
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_SERVICE_NAME: gridcast-web
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=gridcast,deployment.environment.name=local
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACE_SAMPLE_RATIO:-1.0}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  lgtm:
+    image: grafana/otel-lgtm:0.40.0
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_MONITOR_DSN: host=postgres port=5432 user=gridcast password=${POSTGRES_PASSWORD} dbname=gridcast sslmode=disable
+      PROMETHEUS_EXTRA_ARGS: --storage.tsdb.retention.time=7d
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - lgtm_data:/data
+      - ./infra/observability/collector.yaml:/otel-lgtm/otelcol-config.yaml:ro
+      - ./infra/observability/datasources.yaml:/otel-lgtm/grafana/conf/provisioning/datasources/grafana-datasources.yaml:ro
+      - ./infra/observability/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/gridcast.yaml:ro
+      - ./infra/observability/dashboards:/etc/gridcast/dashboards:ro
+    ports:
+      - "127.0.0.1:3001:3000"
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:4040:4040"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  lgtm_data:

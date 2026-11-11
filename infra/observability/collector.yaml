@@ -1,0 +1,93 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  postgresql:
+    endpoint: postgres:5432
+    username: gridcast
+    password: ${env:POSTGRES_PASSWORD}
+    databases: [gridcast]
+    collection_interval: 15s
+    tls:
+      insecure: true
+  sqlquery:
+    driver: postgres
+    datasource: ${env:POSTGRES_MONITOR_DSN}
+    collection_interval: 15s
+    queries:
+      - sql: >-
+          SELECT queryid::text AS query_id, calls,
+          total_exec_time / 1000.0 AS total_seconds,
+          mean_exec_time / 1000.0 AS mean_seconds,
+          rows, shared_blks_hit, shared_blks_read
+          FROM pg_stat_statements
+          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'gridcast')
+          ORDER BY total_exec_time DESC LIMIT 20
+        metrics:
+          - metric_name: gridcast.postgres.query.calls
+            value_column: calls
+            attribute_columns: [query_id]
+            data_type: gauge
+            value_type: int
+          - metric_name: gridcast.postgres.query.total_seconds
+            value_column: total_seconds
+            attribute_columns: [query_id]
+            data_type: gauge
+            value_type: double
+          - metric_name: gridcast.postgres.query.mean_seconds
+            value_column: mean_seconds
+            attribute_columns: [query_id]
+            data_type: gauge
+            value_type: double
+          - metric_name: gridcast.postgres.query.rows
+            value_column: rows
+            attribute_columns: [query_id]
+            data_type: gauge
+            value_type: int
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: collector
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /ready
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    timeout: 5s
+
+exporters:
+  otlp_http/metrics:
+    endpoint: http://127.0.0.1:9090/api/v1/otlp
+  otlp_http/traces:
+    endpoint: http://127.0.0.1:4418
+  otlp_http/logs:
+    endpoint: http://127.0.0.1:3100/otlp
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/traces]
+    metrics:
+      receivers: [otlp, postgresql, sqlquery, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/logs]

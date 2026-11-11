@@ -7,7 +7,7 @@ import { Card } from "@/components/ui";
 import { getRun } from "@/lib/data";
 import type { ManifestEntry, Run } from "@/lib/types";
 
-export type PageProps = { searchParams: Promise<{ run?: string }> };
+export type PageProps = { searchParams: Promise<{ run?: string; view?: string }> };
 
 export async function loadRun(props: PageProps): Promise<{ run: Run | null; manifest: ManifestEntry[] }> {
   return getRun((await props.searchParams).run);
@@ -18,11 +18,11 @@ export function EmptyState() {
     <Card className="p-10 text-center">
       <p className="display text-2xl">No forecast data yet</p>
       <p className="mx-auto mt-3 max-w-xl text-sm text-fog">
-        Generate a forecast with <code className="rounded bg-track px-1">python main.py race 2026 &quot;Brazilian Grand Prix&quot;</code>,
-        then export it with <code className="rounded bg-track px-1">python -m scripts.export_web_data --demo</code>.
+        Submit a forecast above and follow its job status. To load forecasts generated through the CLI,
+        run <code className="rounded bg-track px-1">flask --app backend.app:create_app import-data</code> in the API container.
       </p>
-      <Link href="/method" className="mt-6 inline-block rounded-full bg-red px-6 py-3 text-sm font-bold uppercase tracking-wider">
-        How it works
+      <Link href="/settings" className="mt-6 inline-block rounded-full bg-red px-6 py-3 text-sm font-bold uppercase tracking-wider">
+        Configure predictions
       </Link>
     </Card>
   );

@@ -17,6 +17,7 @@ from sklearn.preprocessing import StandardScaler
 
 from src.data.outcomes import dnf_labels
 from src.utils.logging import setup_logger
+from src.observability.operations import observe
 
 logger = setup_logger(__name__)
 
@@ -98,6 +99,7 @@ class DynamicBayesianStrength:
             covariance += np.diag(reset)
         return mean, covariance
 
+    @observe("ml.bayesian.train")
     def fit(self, frame: pd.DataFrame, context_columns: list[str]) -> DynamicBayesianStrength:
         """Fit chronological Gaussian updates using only supplied training races."""
         from src.models.race_model import chronological_races

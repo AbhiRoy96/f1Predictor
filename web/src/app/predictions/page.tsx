@@ -1,13 +1,19 @@
+import Link from "next/link";
+
+import { DriverOutlook } from "@/components/DriverOutlook";
 import { Heatmap } from "@/components/Heatmap";
+import { JobConsole } from "@/components/JobConsole";
 import { EmptyState, PageHeader, loadRun, type PageProps } from "@/components/PageHeader";
 import { PredictionTable } from "@/components/PredictionTable";
 import { ScenarioPanel } from "@/components/ScenarioPanel";
+import { TeamOutlook } from "@/components/TeamOutlook";
 import { Section, Stat } from "@/components/ui";
 import { num, pct, sessionLabel, stageLabel } from "@/lib/format";
 
 export default async function PredictionsPage(props: PageProps) {
   const { run, manifest } = await loadRun(props);
-  if (!run) return <EmptyState />;
+  const { view } = await props.searchParams;
+  if (!run) return <><JobConsole mode="prediction" /><EmptyState /></>;
   const { meta, drivers } = run;
   const leader = [...drivers].sort((a, b) => b.win_probability - a.win_probability)[0];
   const sumWin = drivers.reduce((total, d) => total + d.win_probability, 0);
@@ -16,6 +22,7 @@ export default async function PredictionsPage(props: PageProps) {
 
   return (
     <>
+      <JobConsole mode="prediction" />
       <PageHeader
         eyebrow={`${meta.year ?? ""} · ${stageLabel(meta.stage)} · ${sessionLabel(meta.session)}`}
         title={`${meta.event_name ?? "Race"} predictions`}
@@ -23,6 +30,14 @@ export default async function PredictionsPage(props: PageProps) {
         run={run}
         manifest={manifest}
       />
+      <nav aria-label="Prediction views" className="mt-6 flex gap-3">
+        {[["forecast", "Forecast"], ["drivers", "Drivers"], ["teams", "Teams"]].map(([key, label]) => (
+          <Link key={key} href={`/predictions?run=${encodeURIComponent(meta.id)}&view=${key}`}
+            aria-current={(view ?? "forecast") === key ? "page" : undefined}
+            className={`rounded border px-5 py-2 font-bold ${(view ?? "forecast") === key ? "border-red bg-red" : "border-line"}`}>{label}</Link>
+        ))}
+      </nav>
+      {view === "drivers" ? <DriverOutlook run={run} /> : view === "teams" ? <TeamOutlook run={run} /> : <>
 
       <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat label="Favourite" value={leader.Abbreviation} hint={leader.DriverName ?? undefined} />
@@ -67,6 +82,7 @@ export default async function PredictionsPage(props: PageProps) {
           ))}
         </dl>
       </Section>
+      </>}
     </>
   );
 }

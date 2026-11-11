@@ -8,6 +8,7 @@ import pandas as pd
 from scipy.optimize import minimize_scalar
 from scipy.special import logsumexp
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from src.observability.operations import observe
 
 
 def simulation_log_loss(examples, temperature=1.0, n_simulations=1024, seed=42):
@@ -37,6 +38,7 @@ def simulation_log_loss(examples, temperature=1.0, n_simulations=1024, seed=42):
     return float(np.mean(values))
 
 
+@observe("ml.calibrate")
 def fit_simulation_temperature(examples, default=1.0, n_simulations=1024, seed=42):
     """Fit one scale against final OOF win and podium probabilities.
 

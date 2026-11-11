@@ -7,7 +7,17 @@ xgboost
 matplotlib
 seaborn
 plotly
-streamlit
+Flask>=3.1,<4
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+gunicorn>=23,<24; sys_platform != "win32"
 joblib
 pyarrow
 requests
+opentelemetry-sdk>=1.38,<2
+opentelemetry-exporter-otlp-proto-http>=1.38,<2
+opentelemetry-instrumentation-flask>=0.59b0,<1
+opentelemetry-instrumentation-requests>=0.59b0,<1
+psutil>=6,<8
+nvidia-ml-py>=12,<14
+pyroscope-io>=0.8,<1; sys_platform == "linux"

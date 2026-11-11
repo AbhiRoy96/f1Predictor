@@ -5,7 +5,6 @@ import { Footer } from "@/components/Footer";
 import { Nav } from "@/components/Nav";
 
 import "@fontsource-variable/noto-sans/wght.css";
-import "@fontsource-variable/noto-sans/wght-italic.css";
 import "./globals.css";
 
 export const metadata: Metadata = {

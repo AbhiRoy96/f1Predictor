@@ -1,19 +1,24 @@
 "use client";
 
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import type { ManifestEntry } from "@/lib/types";
 
 export function RunPicker({ manifest, current }: { manifest: ManifestEntry[]; current: string }) {
   const router = useRouter();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   if (manifest.length < 2) return null;
   return (
     <label className="flex items-center gap-3 text-xs text-fog">
       <span className="eyebrow">Saved run</span>
       <select
         value={current}
-        onChange={(event) => router.push(`${pathname}?run=${encodeURIComponent(event.target.value)}`)}
+        onChange={(event) => {
+          const params = new URLSearchParams(searchParams.toString());
+          params.set("run", event.target.value);
+          router.push(`${pathname}?${params}`);
+        }}
         className="rounded-md border border-line bg-asphalt px-3 py-2 text-sm text-paper"
       >
         {manifest.map((entry) => (

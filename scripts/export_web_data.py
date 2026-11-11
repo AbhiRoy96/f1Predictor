@@ -81,6 +81,9 @@ def _reports(meta: pd.Series, reports_dir: Path) -> dict[str, list[dict]]:
         return {}
     prefix = (f"walk_forward_{meta['session']}_{int(meta['year'])}_"
               f"rnd{int(meta['round_number'])}_{meta['stage']}")
+    variant = meta.get("strength_model", "legacy")
+    if variant in {"ensemble", "bayesian"}:
+        prefix += f"_{variant}"
     found = {}
     for name in REPORT_NAMES:
         path = reports_dir / f"{prefix}_{name}.parquet"
@@ -101,7 +104,7 @@ def build_run(frame: pd.DataFrame, run_id: str, reports: dict | None = None, dem
     for row, matrix_row in zip(drivers, frame[position_columns].to_numpy(float)):
         row["positionProbabilities"] = matrix_row.round(6).tolist()
     meta = {column: first[column] for column in META_COLUMNS if column in frame and pd.notna(first[column])}
-    meta = json.loads(pd.Series(meta).to_json())
+    meta = json.loads(pd.Series(meta).to_json(date_format="iso"))
     meta.update({"id": run_id, "demo": demo})
     return {"meta": meta, "drivers": drivers, "scenarios": _scenario_payloads(frame),
             "reports": reports or {}}

@@ -1,0 +1,26 @@
+{
+  "uid": "gridcast-overview",
+  "title": "Gridcast | Application & ML",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["gridcast", "ml", "otel"],
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "10s",
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Operation throughput / sec", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "sum by (operation, status) (rate(gridcast_operation_count_total[5m]))"}]},
+    {"id": 2, "type": "timeseries", "title": "Operation p95 latency (seconds)", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(gridcast_operation_duration_seconds_bucket[5m])))"}]},
+    {"id": 3, "type": "timeseries", "title": "Queued / running jobs", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "sum by (job_kind, status) (gridcast_jobs_active)"}]},
+    {"id": 4, "type": "timeseries", "title": "Resident memory (bytes)", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "gridcast_process_memory_bytes", "legendFormat": "{{service_name}} / {{service_instance_id}}"}]},
+    {"id": 5, "type": "timeseries", "title": "Active model compute cost estimate (USD, not a bill)", "description": "Empty unless ML_COMPUTE_HOURLY_USD is configured. Excludes idle/infrastructure costs.", "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "sum by (ml_model, operation) (gridcast_ml_estimated_cost_total)"}]},
+    {"id": 6, "type": "stat", "title": "Cost-rate configured (1=yes, 0=unavailable)", "gridPos": {"x": 12, "y": 16, "w": 6, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "max(gridcast_ml_cost_rate_configured{service_name=\"gridcast-worker\"})"}]},
+    {"id": 7, "type": "stat", "title": "NVIDIA telemetry available (1=yes)", "gridPos": {"x": 18, "y": 16, "w": 6, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "max(gridcast_gpu_monitoring_available{service_name=\"gridcast-worker\"})"}]},
+    {"id": 8, "type": "timeseries", "title": "SQL query p95 latency (seconds)", "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le, db_operation) (rate(gridcast_db_query_duration_seconds_bucket[5m])))"}]},
+    {"id": 9, "type": "table", "title": "Top PostgreSQL query fingerprints by execution time", "description": "Top 20 since the last pg_stat_statements reset. No SQL text or bound values are exported.", "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "sort_desc(gridcast_postgres_query_total_seconds)", "instant": true, "format": "table"}]},
+    {"id": 10, "type": "timeseries", "title": "GPU utilization (ratio)", "gridPos": {"x": 0, "y": 32, "w": 8, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "gridcast_gpu_utilization_ratio"}]},
+    {"id": 11, "type": "timeseries", "title": "GPU used memory (bytes)", "gridPos": {"x": 8, "y": 32, "w": 8, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "gridcast_gpu_memory_bytes"}]},
+    {"id": 12, "type": "timeseries", "title": "GPU power (watts)", "gridPos": {"x": 16, "y": 32, "w": 8, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "gridcast_gpu_power_watts"}]},
+    {"id": 13, "type": "logs", "title": "Correlated application and model logs", "gridPos": {"x": 0, "y": 40, "w": 24, "h": 10}, "datasource": {"type": "loki", "uid": "loki"}, "targets": [{"refId": "A", "expr": "{service_name=~\"gridcast-.+\"}"}]},
+    {"id": 14, "type": "timeseries", "title": "ML process CPU time consumed (seconds)", "gridPos": {"x": 0, "y": 50, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "sum by (ml_model, operation) (gridcast_ml_cpu_time_seconds_total)"}]},
+    {"id": 15, "type": "timeseries", "title": "Backend request mean latency (seconds)", "gridPos": {"x": 12, "y": 50, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "sum by (operation) (rate(gridcast_web_backend_duration_seconds_sum[5m])) / sum by (operation) (rate(gridcast_web_backend_duration_seconds_count[5m]))"}]}
+  ]
+}

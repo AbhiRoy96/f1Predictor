@@ -11,6 +11,7 @@ from scipy.optimize import minimize_scalar
 from src.models.bayesian_strength import DynamicBayesianStrength
 from src.models.calibrate import simulation_log_loss
 from src.utils.logging import setup_logger
+from src.observability.operations import observe
 
 logger = setup_logger(__name__)
 
@@ -50,6 +51,7 @@ def blend_distribution(scores: np.ndarray, covariance: np.ndarray, weight: float
     return scores @ np.array([weight, 1 - weight]), covariance * weight**2
 
 
+@observe("ml.ensemble.weight")
 def fit_ensemble_weight(examples: list[dict], default: float = .5,
                         n_simulations: int = 512, seed: int = 42) -> float:
     """Select a weight on OOF final win/podium loss, before final temperature fitting."""

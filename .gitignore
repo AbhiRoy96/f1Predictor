@@ -2,4 +2,7 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
-models/
+/models/
+.env
+.env.*
+!.env.example

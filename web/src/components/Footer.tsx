@@ -31,14 +31,14 @@ export function Footer() {
             not complete championship history. Backtests span few races and do not guarantee future skill.
           </li>
           <li>
-            <strong className="text-paper">Data sources.</strong> Race data via the FastF1 library; profile text and
+            <strong className="text-paper">Data sources.</strong> Prediction evidence via FastF1; season calendars, results and standings via Jolpica. Profile text and
             media, where shown, come from Wikipedia and Wikimedia Commons under their own licences.
           </li>
         </ul>
         <div className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-6 text-xs text-fog">
           <p>Released under the MIT licence. Forecasts are generated from saved point-in-time artifacts.</p>
           <nav className="flex gap-4" aria-label="Footer">
-            <Link href="/method" className="hover:text-paper">Method</Link>
+            <Link href="/settings" className="hover:text-paper">Settings</Link>
             <Link href="/lab" className="hover:text-paper">Model Lab</Link>
           </nav>
         </div>
