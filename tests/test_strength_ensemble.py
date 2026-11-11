@@ -143,7 +143,7 @@ class EnsembleIntegrationTests(unittest.TestCase):
                    side_effect=lambda **kwargs: original(n_estimators=3, **kwargs)):
             result = run_race_walk_forward(race_fixture(6), min_train_races=3, refit_every=2,
                                           n_simulations=50, strength_model="ensemble")
-        self.assertEqual(len(result["metrics"]), 12)
+        self.assertEqual(len(result["metrics"]), 15)
         self.assertTrue(result["predictions"].strength_model.eq("ensemble").all())
         self.assertTrue(np.isfinite(result["summary"].win_log_loss).all())
         self.assertNotIn("strength_covariance_row", result["baselines"])

@@ -69,7 +69,7 @@ class EndToEndImprovementsTests(unittest.TestCase):
             saved = pd.read_parquet(root / "predictions/predictions_race_2024_rnd10_post_quali.parquet")
             self.assertIn("position_error", saved)
             self.assertTrue(saved.variation_measured.all())
-            self.assertEqual(len(evaluated["metrics"]), 8)
+            self.assertEqual(len(evaluated["metrics"]), 10)
             self.assertEqual(evaluated["predictions"].simulation_count.unique().tolist(), [200])
             self.assertTrue((root / "reports/walk_forward_race_2024_rnd10_post_quali_confidence.parquet").exists())
 

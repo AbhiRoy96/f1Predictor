@@ -1,4 +1,7 @@
-# 🏎️ F1 Race Intelligence and Prediction
+---
+title: F1 Race Intelligence and Prediction
+description: Point-in-time Formula 1 forecasting, simulation, evaluation, and dashboards
+---
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -266,7 +269,10 @@ for lower-level collection details.
 ## Feature engineering and leakage prevention
 
 The CLI builds stage-specific feature tables and reuses them only when their
-source-content/code fingerprint matches. It also refreshes the canonical
+raw-file metadata/code fingerprint matches. Raw inputs use path, size, and
+nanosecond modification time; Python sources retain content hashes. Replacing
+raw data must update its size or modification time to invalidate the cache.
+The CLI also refreshes the canonical
 session feature filename for existing analysis pages.
 
 For a standalone rebuild using the feature module's default `post_quali` stage:
@@ -292,6 +298,14 @@ Point-in-time rules apply throughout:
 * Timestamped observations, grid publication, and news respect the cutoff.
 * Missing evidence is represented through missingness handling, not invented measurements.
 
+For `post_quali` race and sprint forecasts, an eligible earlier qualifying grid
+or an official grid with `GridPublishedAt` before the cutoff takes precedence.
+Otherwise qualifying order supplies `grid_position` with `grid_is_quali_proxy=1`.
+Proxy grids do not imply known penalties or pit-lane starts. Official pit-lane
+starts use field size plus one as a back-of-grid position and retain
+`pit_lane_start=1`. Historical race grids without publication evidence are not
+silently treated as known before the cutoff.
+
 Qualifying gaps compare the same Q1, Q2, or Q3 phase. Practice pace excludes
 deleted, inaccurate, flagged, and pit laps when flags exist. Long-run residuals
 compare multiple drivers within the same session, compound, tyre age, and
@@ -303,6 +317,24 @@ Legacy files use saved schedule timestamps where available. A deterministic
 year/round/session fallback cannot recover the actual time of day. Circuit
 identity uses FastF1 location or event name; naming changes may need curated
 aliases.
+
+### Feature and retirement audit
+
+After refreshing data, audit the staged race table and raw status distribution:
+
+```powershell
+python -m scripts.audit_features
+python -m scripts.audit_features --features data\processed\race_features.parquet
+```
+
+The audit saves [reports/feature_audit.json](./reports/feature_audit.json) and
+prints feature coverage, race counts by year, distinct grid positions per race,
+latest-driver inputs (including teammate gaps and newcomer flags), and known
+versus unknown retirement labels. Missingness flags are respected when counting
+neutral-imputed values. It exits with code 1 on missing columns, degenerate
+post-qualifying grids in fields of at least 18 drivers, inconsistent proxies,
+or unavailable raw status data. Use `--raw-dir` and `--output` to select inputs
+and report location.
 
 ### Optional news
 
@@ -396,6 +428,9 @@ collision, and unidentified terminal causes are exclusive components; unknown
 causes are not invented. A shrunk Gaussian-copula race effect allows common
 retirement shocks while preserving marginal risks. This moment estimate is
 approximate, not a fully fitted accident or team-reliability model.
+`Finished`, `Lapped`, and `+N Lap(s)` statuses count as finishes.
+Disqualifications, exclusions, withdrawals, and non-starts remain unknown,
+not retirements.
 
 One temperature calibrates final win/podium probabilities from expanding,
 past-only OOF forecasts, including retirement and the reference scenario.
@@ -429,6 +464,7 @@ rejected. Fewer than ten held-out or calibration races generate warnings.
 Reports include:
 
 * Winner, podium, top-10, and DNF Brier scores
+* DNF Brier skill against a constant rate estimated from that fold's training labels
 * Winner/podium log loss, marginal finishing-position log loss, and ranked probability score
 * Rank correlations, position errors, and P10-P90 outcome-range coverage
 * Baseline comparisons, reliability tables, and driver/team signed-error reports
@@ -443,6 +479,16 @@ Confidence reports use 500 circular race-block bootstrap samples with block
 length `ceil(number_of_races ** (1/3))`. Intervals are omitted with fewer than
 five held-out races. They describe the sampled backtest, not a guarantee of
 improvement or a remedy for selective circuit coverage.
+
+The grid baseline skips constant or missing candidate columns, and the separate
+`quali` baseline uses only `quali_position`. An unavailable starting-order feature
+produces uniform strengths with a warning, not a claimed informative benchmark.
+`dnf_constant_brier` measures the training-rate prediction's squared error on
+the same held-out labels as the model. `dnf_brier_skill = 1 - dnf_brier /
+dnf_constant_brier`; positive values indicate improvement. Skill is unavailable
+when training labels are unknown or reference error is zero.
+Summary and bootstrap skill scores use the ratio of race-averaged losses,
+not the average of individual race skill scores.
 
 ### Single completed-event variation
 
@@ -531,6 +577,10 @@ models\
 reports\                 Walk-forward metrics, predictions, reliability, confidence
 ```
 
+Generated models are ignored by Git; obsolete standalone model binaries are
+not distributed. The tested standalone training modules and baseline classes
+remain legacy comparison APIs, not the production CLI path.
+
 Staged feature files use `<session>_<stage>_features.parquet` and a `.sha256`
 sidecar; canonical `<session>_features.parquet` copies support existing analysis
 pages. Model metadata records the variant, training hash, stage/session, feature
@@ -558,7 +608,11 @@ and confidence tables.
 Prediction rows contain `prob_p*` finishing distributions, win/podium/top-10/DNF
 probabilities, expected/median/P10/P90 positions, model and training provenance,
 stage, generation timestamp, scenario, simulation count, and seed.
-The terminal prints forecasts and held-out errors separately.
+`p10_finish` and `p90_finish` are empirical position quantiles conditional on
+that driver not retiring, not ranks among finishers. They remain missing if no
+simulation has the driver finish. These intervals use unsmoothed simulation
+samples; the unconditional position distribution retains its existing smoothing.
+The terminal prints decimal probabilities and separates forecasts from held-out errors.
 
 Old model artifacts fail the current data/code fingerprint check and must be
 retrained. Preserve raw inputs, artifacts, configuration, and the dependency

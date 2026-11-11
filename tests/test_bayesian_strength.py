@@ -196,8 +196,8 @@ class BayesianIntegrationTests(unittest.TestCase):
     def test_walk_forward_supports_challenger_without_posterior_baselines(self):
         result = run_race_walk_forward(race_fixture(6), min_train_races=3, refit_every=2,
                                       n_simulations=50, strength_model="bayesian")
-        self.assertEqual(set(result["summary"].model), {"race_model", "grid", "championship", "team"})
-        self.assertEqual(len(result["metrics"]), 12)
+        self.assertEqual(set(result["summary"].model), {"race_model", "grid", "quali", "championship", "team"})
+        self.assertEqual(len(result["metrics"]), 15)
         self.assertTrue(result["predictions"].strength_model.eq("bayesian").all())
         self.assertNotIn("strength_covariance_row", result["baselines"])
         self.assertTrue(np.isfinite(result["summary"].position_mae).all())

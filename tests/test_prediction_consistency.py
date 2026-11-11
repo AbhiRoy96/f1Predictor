@@ -29,6 +29,7 @@ class PredictionConsistencyTests(unittest.TestCase):
             prediction = self.model.predict(target, n_simulations=1500, seed=19, scenario=scenario)
             replay = simulate_saved_prediction(prediction.sample(frac=1, random_state=8), scenario)
             columns = ["win_probability", "podium_probability", "dnf_probability", "expected_position",
+                       "p10_finish", "p90_finish",
                        *[f"prob_p{i}" for i in range(1, 7)]]
             expected = prediction.set_index("Abbreviation").sort_index()[columns]
             actual = replay.set_index("Abbreviation").sort_index()[columns]

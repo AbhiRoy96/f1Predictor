@@ -160,6 +160,7 @@ def main():
     st.caption(" | ".join(f"{key}: {value}" for key, value in provenance.items()))
     st.caption(
         "P10-P90 ranges describe simulated finishing outcomes, not parameter confidence intervals. "
+        "p10_finish and p90_finish condition on the driver not retiring; missing values mean no simulated finishes. "
         "MC standard errors measure numerical sampling error only.")
     if metadata.get("training_races", metadata.get("n_train_races", 0)) < 30:
         st.warning("Limited historical evidence: probabilities and calibration need more held-out races before they can be trusted.")
@@ -184,7 +185,7 @@ def main():
     uncertainty_columns = [
         "DriverName", "Abbreviation", "TeamName", "win_probability", "podium_probability",
         "top10_probability", "expected_position", "median_position", "p10_position",
-        "p90_position", "dnf_probability", "vs_grid_order",
+        "p90_position", "p10_finish", "p90_finish", "dnf_probability", "vs_grid_order",
         "win_probability_mcse",
     ]
     st.markdown("### Race prediction and uncertainty")

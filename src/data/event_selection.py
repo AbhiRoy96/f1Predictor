@@ -55,7 +55,7 @@ def select_related_events(schedule, target, collection_year, target_year,
     events["RoundNumber"] = pd.to_numeric(events.RoundNumber).astype(int)
     events = events.sort_values("RoundNumber").drop_duplicates("RoundNumber")
     if collection_year == target_year:
-        events = events.loc[events.RoundNumber.le(int(target.RoundNumber))]
+        events = events.loc[events.RoundNumber.le(int(target.RoundNumber))].copy()
     if events.empty:
         return events
     events["_circuit"] = events.apply(event_circuit, axis=1)

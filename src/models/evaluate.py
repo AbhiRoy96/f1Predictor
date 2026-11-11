@@ -220,18 +220,26 @@ def reliability(probabilities, outcomes, bins=10):
 def _baseline_strength(df, name):
     candidates = {
         "grid": ["grid_position", "GridPosition", "quali_position", "driver_qualifying_season_avg_position"],
+        "quali": ["quali_position"],
         "championship": ["driver_race_season_points_per_start", "driver_race_season_points", "driver_race_career_points"],
         "team": ["constructor_race_season_points_per_start", "constructor_race_season_points", "constructor_race_career_points"],
     }[name]
-    column = next((c for c in candidates if c in df), None)
-    if column is None:
-        return np.zeros(len(df))
-    values = pd.to_numeric(df[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    if name == "grid":
-        values = values.where(values > 0)
-        return -values.fillna((len(df) + 1) / 2).to_numpy(float) / 3
-    # Fixed scaling prevents raw points from overwhelming the bounded temperature fit.
-    return values.fillna(0).to_numpy(float) / (20 if name == "championship" else 40)
+    for column in candidates:
+        if column not in df:
+            continue
+        values = pd.to_numeric(df[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if column + "_is_missing" in df:
+            values = values.mask(df[column + "_is_missing"].eq(1))
+        if name in {"grid", "quali"}:
+            values = values.where(values > 0)
+        if values.nunique() <= 1:
+            continue
+        if name in {"grid", "quali"}:
+            return -values.fillna((len(df) + 1) / 2).to_numpy(float) / 3
+        # Fixed scaling prevents raw points from overwhelming the bounded temperature fit.
+        return values.fillna(0).to_numpy(float) / (20 if name == "championship" else 40)
+    logger.warning("No varying eligible feature for %s baseline; using uniform strengths.", name)
+    return np.zeros(len(df))
 
 
 def _complete_race_metrics(frame):
@@ -256,6 +264,10 @@ def _complete_race_metrics(frame):
     dnf_known = frame.target_dnf.notna().to_numpy()
     dnf_brier = float(np.mean((frame.dnf_probability.to_numpy()[dnf_known]
                               - frame.target_dnf.to_numpy()[dnf_known]) ** 2)) if dnf_known.any() else np.nan
+    base_rate = frame.get("training_dnf_base_rate", pd.Series(np.nan, index=frame.index)).to_numpy(float)
+    constant_brier = (float(np.mean((base_rate[dnf_known] - frame.target_dnf.to_numpy()[dnf_known]) ** 2))
+                      if dnf_known.any() and np.isfinite(base_rate[dnf_known]).all() else np.nan)
+    dnf_skill = 1 - dnf_brier / constant_brier if constant_brier > 0 else np.nan
     finishers = order[frame.target_dnf.to_numpy()[order] == 0]
     conditional_nll = (pl_nll(frame.strength.to_numpy(), finishers, float(frame.pl_temperature.iloc[0]))
                        if len(finishers) > 1 else np.nan)
@@ -281,8 +293,21 @@ def _complete_race_metrics(frame):
         "position_mae": float(np.abs(signed).mean()),
         "position_median_absolute_error": float(np.median(np.abs(signed))),
         "position_error_std": float(signed.std()),
-        "dnf_brier": dnf_brier, "top10_brier": float(np.mean((frame.top10_probability - top10) ** 2)),
+        "dnf_brier": dnf_brier, "dnf_constant_brier": constant_brier,
+        "dnf_brier_skill": float(dnf_skill),
+        "top10_brier": float(np.mean((frame.top10_probability - top10) ** 2)),
     }
+
+
+def _mean_race_metrics(values, names):
+    means = values.mean(axis=-2)
+    if {"dnf_brier_skill", "dnf_brier", "dnf_constant_brier"}.issubset(names):
+        baseline = means[..., names.index("dnf_constant_brier")]
+        loss = means[..., names.index("dnf_brier")]
+        ratio = np.divide(loss, baseline, out=np.full_like(baseline, np.nan), where=baseline > 0)
+        # A skill score is a ratio of aggregate losses, not a mean of per-race ratios.
+        means[..., names.index("dnf_brier_skill")] = 1 - ratio
+    return means
 
 
 def bootstrap_race_metrics(metrics, seed=42):
@@ -304,12 +329,15 @@ def bootstrap_race_metrics(metrics, seed=42):
             if against == "grid_difference" and model == "grid":
                 continue
             values = frame[names].to_numpy(float)
+            estimate = _mean_race_metrics(values, names)
+            means = _mean_race_metrics(values[indices], names)
             if against == "grid_difference":
-                values = values - reference.reindex(frame.index)[names].to_numpy(float)
-            means = values[indices].mean(axis=1)
+                reference_values = reference.reindex(frame.index)[names].to_numpy(float)
+                estimate -= _mean_race_metrics(reference_values, names)
+                means -= _mean_race_metrics(reference_values[indices], names)
             for j, metric in enumerate(names):
                 bounds = np.percentile(means[:, j], [2.5, 97.5]) if n >= 5 else [np.nan, np.nan]
-                rows.append(dict(model=model, reference=against, metric=metric, estimate=float(values[:, j].mean()),
+                rows.append(dict(model=model, reference=against, metric=metric, estimate=float(estimate[j]),
                                  ci_low=bounds[0], ci_high=bounds[1], n_races=n, block_length=block))
     return pd.DataFrame(rows, columns=columns)
 
@@ -319,7 +347,7 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
     """Shared expanding folds, in memory only.
 
     Returns DataFrames: predictions (race model), baselines (long, model=grid/
-    championship/team), metrics (one row/model/race), summary (one row/model),
+    quali/championship/team), metrics (one row/model/race), summary (one row/model),
     folds (one row/refit), reliability (model/target/bin), driver_bias and team_bias.
     Reliability target-specific aliases reliability_win/podium/top10/dnf are included.
     Position errors are predicted minus actual; rolling bias uses the latest five races.
@@ -344,6 +372,7 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
     baseline_calibration = {}
     dnf_model = None
     train_end = None
+    training_dnf_base_rate = np.nan
     fold = -1
     for i in range(min_train_races, len(races)):
         test = df.iloc[races[i]].reset_index(drop=True)
@@ -355,9 +384,10 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
             model.random_seed = seed
             model.fit(train)
             dnf_model = model.dnf_model_
+            training_dnf_base_rate = float(dnf_labels(train)[0].mean())
             train_end = model.metadata_["training_end"]
             baseline_calibration = {}
-            for name in ["grid", "championship", "team"]:
+            for name in ["grid", "quali", "championship", "team"]:
                 examples = [dict(example, strength=_baseline_strength(example["frame"], name),
                                  strength_covariance=None)
                             for example in model.calibration_examples_]
@@ -404,6 +434,7 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
             output["target_podium"] = test.target_position.le(min(3, len(test))).to_numpy(int)
             output["target_top10"] = test.target_position.le(min(10, len(test))).to_numpy(int)
             output["target_dnf"] = dnf_labels(test)[0].to_numpy()
+            output["training_dnf_base_rate"] = training_dnf_base_rate
             output["fold"] = fold
             output["race_index"] = i
             output["training_end"] = train_end
@@ -427,7 +458,10 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
                 reliability_frames.append(table)
     metrics = pd.DataFrame(metric_rows)
     metric_names = [c for c in metrics if c not in {"model", "race_index", "fold", "Year", "RoundNumber"}]
-    summary = metrics.groupby("model", sort=False)[metric_names].mean().reset_index() if metric_names else pd.DataFrame()
+    summary = pd.DataFrame([
+        {"model": name, **dict(zip(metric_names, _mean_race_metrics(frame[metric_names].to_numpy(float), metric_names)))}
+        for name, frame in metrics.groupby("model", sort=False)
+    ]) if metric_names else pd.DataFrame()
     if not summary.empty:
         grid_mae = summary.loc[summary.model.eq("grid"), "position_mae"].iloc[0]
         summary["position_mae_vs_grid"] = summary.position_mae - grid_mae

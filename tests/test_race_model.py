@@ -25,7 +25,7 @@ def race_fixture(n_races=8, field_size=6):
             "SessionStartUtc": pd.Timestamp("2026-01-01", tz="UTC") + pd.Timedelta(days=7 * race),
             "Abbreviation": [f"D{i}" for i in range(field_size)],
             "TeamName": [f"T{i // 2}" for i in range(field_size)],
-            "stage": "post_quali", "grid_position": grid,
+            "stage": "post_quali", "grid_position": grid, "quali_position": grid,
             "driver_race_season_points": (field_size - grid) * race * 3,
             "constructor_race_season_points": (field_size - grid // 2) * race * 5,
             "driver_race_season_avg_position": grid.astype(float),

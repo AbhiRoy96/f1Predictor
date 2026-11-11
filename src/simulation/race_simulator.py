@@ -89,6 +89,11 @@ def summarize_positions(positions, retired, prior_mass=0.5):
     matrix = (matrix + prior_mass * prior) / (count + prior_mass)
     cumulative = matrix.cumsum(axis=1)
     p_win = matrix[:, 0]
+    finish_quantiles = np.full((2, n), np.nan)
+    for driver in range(n):
+        finished_positions = positions[~retired[:, driver], driver]
+        if len(finished_positions):
+            finish_quantiles[:, driver] = np.percentile(finished_positions, [10, 90], method="inverted_cdf")
     result = pd.DataFrame({
         "win_probability": p_win,
         "podium_probability": matrix[:, :3].sum(axis=1) if n > 3 else np.ones(n),
@@ -98,6 +103,8 @@ def summarize_positions(positions, retired, prior_mass=0.5):
         "median_position": (cumulative < .5).sum(axis=1) + 1,
         "p10_position": (cumulative < .1).sum(axis=1) + 1,
         "p90_position": (cumulative < .9).sum(axis=1) + 1,
+        "p10_finish": finish_quantiles[0],
+        "p90_finish": finish_quantiles[1],
         "win_probability_mcse": np.sqrt(p_win * (1 - p_win) / count),
         "probability_smoothing_mass": prior_mass,
     })

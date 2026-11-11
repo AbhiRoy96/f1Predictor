@@ -508,6 +508,7 @@ def _stage_features(target, event, laps, weather, messages):
         "weekend_source_session_types": ",".join(sorted(set().union(
             *(set(frame["SessionType"]) for frame in provenance)))) if provenance else "",
         "grid_source_max_utc": pd.NaT,
+        "grid_is_quali_proxy": 0,
     }
     for column in ("grid_position", "quali_position", "quali_gap_to_pole_pct",
                    "quali_gap_to_teammate_pct", "grid_penalty_places", "pit_lane_start",
@@ -543,18 +544,24 @@ def _stage_features(target, event, laps, weather, messages):
                 features["quali_gap_to_teammate_pct"] = (own_time / mate - 1) * 100
             grid = driver.iloc[-1]["GridPosition"]
             if pd.notna(grid) and grid >= 0:
-                features["grid_position"] = grid if grid > 0 else np.nan
+                features["grid_position"] = grid if grid > 0 else event.loc[
+                    event.SessionType.eq(target["SessionType"]), "Abbreviation"].nunique() + 1
                 features["pit_lane_start"] = int(grid == 0)
                 features["grid_source_max_utc"] = driver.iloc[-1]["SessionStartUtc"]
         published = pd.to_datetime(target.get("GridPublishedAt"), utc=True, errors="coerce")
         if pd.notna(published) and published < target["FeatureCutoffUtc"]:
             grid = target["GridPosition"]
             if pd.notna(grid) and grid >= 0:
-                features["grid_position"] = grid if grid > 0 else np.nan
+                features["grid_position"] = grid if grid > 0 else event.loc[
+                    event.SessionType.eq(target["SessionType"]), "Abbreviation"].nunique() + 1
                 features["pit_lane_start"] = int(grid == 0)
                 features["grid_source_max_utc"] = published
         if pd.notna(features["grid_position"]) and pd.notna(features["quali_position"]):
             features["grid_penalty_places"] = features["quali_position"] - features["grid_position"]
+        if pd.isna(features["grid_position"]) and pd.notna(features["quali_position"]):
+            features["grid_position"] = features["quali_position"]
+            features["grid_is_quali_proxy"] = 1
+            features["grid_source_max_utc"] = driver.iloc[-1]["SessionStartUtc"]
 
     practice = selected[0]
     if not practice.empty and "LapTime" in practice and "Abbreviation" in practice:
@@ -602,6 +609,7 @@ def build_features(results, laps=None, weather=None, messages=None, news=None, s
     and NaN Position/Points/Status. No dates, entrants or outcomes are fabricated.
     GridPosition on a race result is ignored unless GridPublishedAt proves it was
     available before the cutoff; earlier qualifying GridPosition is also accepted.
+    Otherwise qualifying order is a flagged proxy, not an inferred official grid.
     """
     if stage not in STAGES:
         raise ValueError(f"Unknown stage {stage!r}; expected one of {STAGES}")

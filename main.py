@@ -113,9 +113,13 @@ def _data_hash(paths, context=""):
     digest = hashlib.sha256(context.encode())
     for path in sorted(paths, key=str):
         digest.update(str(path).encode())
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
+        if path.suffix == ".py":
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+        else:
+            stat = path.stat()
+            digest.update(f":{stat.st_size}:{stat.st_mtime_ns}".encode())
     return digest.hexdigest()
 
 
@@ -169,7 +173,7 @@ def _add_scheduled_target(results, session, year, event):
 def ensure_processed_data(session: str, year: int, event: str, stage="post_quali",
                           skip_collection=False, events_per_season=DEFAULT_EVENTS_PER_SEASON,
                           similar_circuits=None) -> Path:
-    """Build or reuse a source-content-addressed staged feature table."""
+    """Cache staged features using raw file metadata and source code content."""
     if session not in SESSION_TYPES or stage not in STAGES:
         raise ValueError("Unsupported session or prediction stage.")
     if year < HISTORICAL_START_YEAR:
@@ -366,11 +370,12 @@ def _model_artifact(feature_path, training, stage, session, action, model_path=N
 def _print_predictions(predictions, session):
     columns = ["Abbreviation", "DriverName", "TeamName", "win_probability", "podium_probability",
                "top10_probability", "expected_position", "median_position", "p10_position",
-               "p90_position", "dnf_probability", "vs_grid_order"]
+               "p90_position", "p10_finish", "p90_finish", "dnf_probability", "vs_grid_order"]
     print("\n" + "=" * 70)
     print(f"{session.upper()} PREDICTIONS")
     print("=" * 70)
-    print(predictions[[column for column in columns if column in predictions]].to_string(index=False))
+    print(predictions[[column for column in columns if column in predictions]].to_string(
+        index=False, float_format=lambda value: f"{value:.3f}"))
     print("=" * 70)
 
 

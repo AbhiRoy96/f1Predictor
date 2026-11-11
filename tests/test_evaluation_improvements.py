@@ -61,7 +61,7 @@ class TestEvaluationImprovements(unittest.TestCase):
         self.assertEqual(result["folds"].n_train_races.tolist(), [3, 5])
         expected = set(result["predictions"].race_index)
         for name, frame in result["baselines"].groupby("model"):
-            self.assertIn(name, ["grid", "championship", "team"])
+            self.assertIn(name, ["grid", "quali", "championship", "team"])
             self.assertEqual(set(frame.race_index), expected)
             for race_index, race in frame.groupby("race_index"):
                 self.assertAlmostEqual(race.win_probability.sum(), 1)
@@ -78,18 +78,19 @@ class TestEvaluationImprovements(unittest.TestCase):
         expected = {"win_log_loss", "win_brier", "top_1_accuracy", "top_3_coverage", "podium_brier",
                     "podium_log_loss", "top_3_overlap", "spearman", "kendall_tau", "finisher_pl_nll_diagnostic",
                     "position_mae", "position_median_absolute_error", "position_error_std", "dnf_brier",
+                    "dnf_constant_brier", "dnf_brier_skill",
                     "position_log_loss", "position_rps", "position_interval_80_coverage"}
         self.assertTrue(expected.issubset(result["metrics"].columns))
-        self.assertEqual(len(result["metrics"]), 16)
-        self.assertEqual(set(result["summary"].model), {"race_model", "grid", "championship", "team"})
+        self.assertEqual(len(result["metrics"]), 20)
+        self.assertEqual(set(result["summary"].model), {"race_model", "grid", "quali", "championship", "team"})
         self.assertTrue(np.isfinite(result["metrics"][list(expected)]).all().all())
         self.assertNotIn("pl_log_likelihood", result["metrics"])
         self.assertNotIn("position_signed_error", result["metrics"])
         self.assertTrue(result["confidence"].ci_low.isna().all())
         for target in ["win", "podium", "top10", "dnf"]:
             table = result[f"reliability_{target}"]
-            self.assertEqual(set(table.model), {"race_model", "grid", "championship", "team"})
-            self.assertEqual(table.n.sum(), 4 * 4 * 6)
+            self.assertEqual(set(table.model), {"race_model", "grid", "quali", "championship", "team"})
+            self.assertEqual(table.n.sum(), 5 * 4 * 6)
         for name in ["driver_bias", "team_bias"]:
             self.assertIn("rolling_signed_error", result[name])
             self.assertFalse(result[name].empty)
@@ -109,6 +110,18 @@ class TestEvaluationImprovements(unittest.TestCase):
         b = result["baselines"].query("race_index == 3")[columns].sort_values(["model", "Abbreviation"]).reset_index(drop=True)
         pd.testing.assert_frame_equal(a, b)
         self.assertEqual(self.result["folds"].baseline_calibration.iloc[0], result["folds"].baseline_calibration.iloc[0])
+
+    def test_dnf_skill_uses_training_rate_and_held_out_squared_errors(self):
+        for _, race in self.result["predictions"].groupby("race_index"):
+            training_rounds = self.result["folds"].query("fold == @race.fold.iloc[0]").n_train_races.iloc[0]
+            expected_rate = self.frame.loc[self.frame.RoundNumber.le(training_rounds), "target_dnf"].mean()
+            np.testing.assert_allclose(race.training_dnf_base_rate, expected_rate)
+            constant_brier = ((race.target_dnf - expected_rate) ** 2).mean()
+            actual = self.result["metrics"].query("model == 'race_model' and race_index == @race.race_index.iloc[0]").iloc[0]
+            self.assertAlmostEqual(actual.dnf_constant_brier, constant_brier)
+            self.assertAlmostEqual(actual.dnf_brier_skill, 1 - actual.dnf_brier / constant_brier)
+        summary = self.result["summary"]
+        np.testing.assert_allclose(summary.dnf_brier_skill, 1 - summary.dnf_brier / summary.dnf_constant_brier)
 
     def test_no_production_artifact_writes_and_opt_in_reports(self):
         root = Path(__file__).resolve().parents[1]
