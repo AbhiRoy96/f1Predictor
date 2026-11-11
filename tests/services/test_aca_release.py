@@ -35,12 +35,35 @@ class LockContracts(unittest.TestCase):
 class ReleaseContracts(unittest.TestCase):
     def run_release(self, operation="Deploy", failure=""):
         script = str(ROOT / "scripts" / "Deploy-Aca.ps1").replace("'", "''")
+        parameters = str(ROOT / "infra" / "azure" / "apps" / "terraform.tfvars.example").replace("'", "''")
         harness = r"""
 . '__SCRIPT__' -ResourceGroup test -Prefix gridcast -ReleaseTag ('a' * 40) `
     -EntraClientId '00000000-0000-0000-0000-000000000001' `
-    -EntraTenantId '00000000-0000-0000-0000-000000000002' -Operation __OPERATION__
+    -EntraTenantId '00000000-0000-0000-0000-000000000002' -Operation __OPERATION__ `
+    -ParametersFile '__PARAMETERS__'
 $Calls = [System.Collections.Generic.List[string]]::new()
 $Failure = '__FAILURE__'
+$PlanKinds = @{}
+function Invoke-Terraform {
+    param([string[]]$Arguments, [switch]$AsJson)
+    if ($Arguments[0] -eq 'apply') {
+        $Calls.Add("terraform apply $($PlanKinds[$Arguments[-1]])")
+        if ($Failure -eq 'apply') { throw 'Terraform failed: apply.' }
+        return
+    }
+    $Calls.Add("terraform $($Arguments -join ' ')")
+    if ($Arguments[0] -eq 'plan') {
+        if ($Failure -eq 'plan') { throw 'Terraform failed: plan.' }
+        $Path = ($Arguments | Where-Object { $_ -like '-out=*' }).Substring(5)
+        $PlanKinds[$Path] = $(if ($Arguments -contains '-target=azapi_resource.init') {'init'} else {'apps'})
+    }
+    if ($Arguments[0] -eq 'show') {
+        return [pscustomobject]@{
+            resource_changes=@(@{change=@{actions=$(if ($Failure -eq 'replacement') {@('delete','create')} else {@('update')})}})
+            planned_values=@{outputs=@{storage_name=@{value='sttest'}}}
+        }
+    }
+}
 function Invoke-AzJson {
     param([string[]]$Arguments)
     $Call = $Arguments -join ' '
@@ -57,7 +80,6 @@ function Invoke-AzJson {
         return [pscustomobject]@{name='old-worker';properties=@{active=$true}}
     }
     if ($Call -like 'containerapp replica list*') { return }
-    if ($Call -like 'deployment group show*') { return 'sttest' }
     if ($Call -like 'storage share-rm snapshot*') {
         return [pscustomobject]@{name=$Arguments[-3];snapshotTime='2026-11-11T00:00:00Z'}
     }
@@ -97,7 +119,8 @@ try {
     @{state=$null;calls=$Calls;error=$_.Exception.Message} | ConvertTo-Json -Depth 10 -Compress
 }
 """
-        harness = harness.replace("__SCRIPT__", script).replace("__OPERATION__", operation).replace("__FAILURE__", failure)
+        harness = (harness.replace("__SCRIPT__", script).replace("__PARAMETERS__", parameters)
+                   .replace("__OPERATION__", operation).replace("__FAILURE__", failure))
         completed = subprocess.run(
             [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", harness],
             check=True, text=True, capture_output=True, timeout=30,
@@ -107,8 +130,10 @@ try {
     def test_preview_has_no_mutating_commands(self):
         result = self.run_release("Preview")
         self.assertIsNone(result["error"])
-        self.assertEqual(len(result["calls"]), 1)
-        self.assertIn("what-if", result["calls"][0])
+        self.assertEqual(len(result["calls"]), 3)
+        self.assertIn("terraform validate", result["calls"][0])
+        self.assertIn("terraform plan", result["calls"][1])
+        self.assertIn("terraform show -json", result["calls"][2])
 
     def test_release_orders_migration_worker_and_auth_before_exposure(self):
         result = self.run_release()
@@ -116,10 +141,12 @@ try {
         calls = result["calls"]
         stop = next(i for i, call in enumerate(calls) if "revision deactivate" in call)
         migrate = next(i for i, call in enumerate(calls) if "job start" in call)
-        apps = next(i for i, call in enumerate(calls) if "group create" in call and "shouldDeployApps=true" in call)
+        init = calls.index("terraform apply init")
+        apps = calls.index("terraform apply apps")
         auth = next(i for i, call in enumerate(calls) if call.startswith("rest "))
         expose = next(i for i, call in enumerate(calls) if "--type external" in call)
         self.assertLess(stop, migrate)
+        self.assertLess(init, migrate)
         self.assertLess(migrate, apps)
         self.assertLess(auth, expose)
         self.assertTrue(any("replica list" in call for call in calls))
@@ -133,7 +160,7 @@ try {
     def test_migration_failure_prevents_app_update_and_exposure(self):
         result = self.run_release(failure="migration")
         self.assertIn("initialization failed", result["error"])
-        self.assertFalse(any("shouldDeployApps=true" in call and "group create" in call for call in result["calls"]))
+        self.assertNotIn("terraform apply apps", result["calls"])
         self.assertFalse(any("--type external" in call for call in result["calls"]))
 
     def test_auth_failure_never_enables_external_ingress(self):
@@ -150,7 +177,21 @@ try {
         result = self.run_release("Rollback")
         self.assertIsNone(result["error"])
         self.assertFalse(any("job start" in call for call in result["calls"]))
-        self.assertTrue(any("group create" in call and "shouldDeployApps=true" in call for call in result["calls"]))
+        self.assertIn("terraform apply apps", result["calls"])
+        self.assertNotIn("terraform apply init", result["calls"])
+
+    def test_plan_failures_or_replacements_abort_before_cloud_mutation(self):
+        for failure in ("plan", "replacement"):
+            with self.subTest(failure=failure):
+                result = self.run_release(failure=failure)
+                self.assertIsNotNone(result["error"])
+                self.assertTrue(all(call.startswith("terraform ") for call in result["calls"]))
+                self.assertFalse(any(call.startswith("terraform apply") for call in result["calls"]))
+
+    def test_apply_failure_never_starts_migration_or_exposes_web(self):
+        result = self.run_release(failure="apply")
+        self.assertIn("Terraform failed: apply", result["error"])
+        self.assertFalse(any("job start" in call or "--type external" in call for call in result["calls"]))
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell 7 is needed for offline snapshot retention tests")

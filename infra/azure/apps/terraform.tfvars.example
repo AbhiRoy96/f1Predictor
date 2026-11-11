@@ -1,0 +1,5 @@
+registry_name        = "<foundation-registry-name>"
+vault_name           = "<foundation-vault-name>"
+storage_account_name = "<foundation-storage-name>"
+otlp_endpoint        = null
+scheduled_forecasts  = []

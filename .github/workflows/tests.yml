@@ -56,9 +56,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: az bicep upgrade
-      - run: az bicep build --file infra/azure/foundation.bicep --outfile /tmp/foundation.json
-      - run: az bicep build --file infra/azure/apps.bicep --outfile /tmp/apps.json
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive infra/azure
+      - run: terraform -chdir=infra/azure/foundation init -backend=false -input=false
+      - run: terraform -chdir=infra/azure/foundation validate
+      - run: terraform -chdir=infra/azure/apps init -backend=false -input=false
+      - run: terraform -chdir=infra/azure/apps validate
+      - run: terraform -chdir=infra/azure/foundation test
+      - run: terraform -chdir=infra/azure/apps test
       - shell: pwsh
         run: |
           $tokens = $null; $errors = $null

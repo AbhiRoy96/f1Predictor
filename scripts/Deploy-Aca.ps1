@@ -12,7 +12,7 @@
 .PARAMETER ResourceGroup
     Existing foundation resource group.
 .PARAMETER Prefix
-    Prefix used by foundation.bicep.
+    Prefix used by the Terraform foundation.
 .PARAMETER ReleaseTag
     Git SHA tagging both previously built linux/amd64 images.
 .PARAMETER EntraClientId
@@ -22,13 +22,13 @@
 .PARAMETER Operation
     Preview, Deploy, or Rollback. Preview is the safe default.
 .PARAMETER ParametersFile
-    Optional ARM parameter file for non-secret app settings such as schedules and OTLP.
+    Terraform variable file with foundation resource names and optional schedules and OTLP.
 .PARAMETER StatePath
     Optional output path for the previous release metadata. No secret values are recorded.
 .EXAMPLE
-    ./scripts/Deploy-Aca.ps1 -ResourceGroup staging -Prefix gridcast -ReleaseTag abc1234 -EntraClientId <id> -EntraTenantId <id>
+    ./scripts/Deploy-Aca.ps1 -ResourceGroup staging -Prefix gridcast -ReleaseTag abc1234 -EntraClientId <id> -EntraTenantId <id> -ParametersFile staging.tfvars
 .NOTES
-    Requires Azure CLI with containerapp support and an existing foundation deployment.
+    Requires Azure CLI, Terraform, an existing foundation and an initialized apps backend.
 #>
 [CmdletBinding()]
 param(
@@ -38,13 +38,61 @@ param(
     [Parameter(Mandatory)][guid]$EntraClientId,
     [Parameter(Mandatory)][guid]$EntraTenantId,
     [ValidateSet('Preview', 'Deploy', 'Rollback')][string]$Operation = 'Preview',
-    [string]$ParametersFile,
+    [Parameter(Mandatory)][string]$ParametersFile,
     [string]$StatePath
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 #region Functions
+function Invoke-Terraform {
+    <#
+    .SYNOPSIS
+        Execute Terraform against the application root and reject native failures.
+    .OUTPUTS
+        Parsed JSON when requested, otherwise console output.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([Parameter(Mandatory)][string[]]$Arguments, [switch]$AsJson)
+    $Directory = Join-Path (Split-Path $PSScriptRoot -Parent) 'infra\azure\apps'
+    $Result = & terraform "-chdir=$Directory" @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "Terraform failed: $($Arguments[0])." }
+    if ($AsJson) { return ($Result -join "`n" | ConvertFrom-Json -Depth 100) }
+    $Result | ForEach-Object { Write-Host $_ }
+}
+
+function Invoke-AcaPlan {
+    <#
+    .SYNOPSIS
+        Plan an app update, refuse deletions and optionally apply that exact plan.
+    .OUTPUTS
+        Parsed Terraform plan.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)][string[]]$VariableArguments,
+        [switch]$InitOnly,
+        [switch]$Apply
+    )
+    $PlanPath = Join-Path ([System.IO.Path]::GetTempPath()) "$([guid]::NewGuid()).tfplan"
+    try {
+        $Arguments = @('plan', '-input=false', '-no-color', "-out=$PlanPath") + $VariableArguments
+        if ($InitOnly) { $Arguments += '-target=azapi_resource.init' }
+        Invoke-Terraform $Arguments
+        $Plan = Invoke-Terraform @('show', '-json', $PlanPath) -AsJson
+        if (@($Plan.resource_changes | Where-Object { $_.change.actions -contains 'delete' }).Count -gt 0) {
+            throw 'Terraform plan includes deletion or replacement; resolve it manually before releasing.'
+        }
+        if ($Apply) { Invoke-Terraform @('apply', '-input=false', '-no-color', $PlanPath) }
+        return $Plan
+    }
+    finally {
+        if (Test-Path -LiteralPath $PlanPath) { Remove-Item -LiteralPath $PlanPath }
+    }
+}
+
 function Invoke-AzJson {
     <#
     .SYNOPSIS
@@ -93,17 +141,15 @@ function Invoke-AcaRelease {
     [CmdletBinding()]
     [OutputType([object])]
     param()
-    $Template = Join-Path (Split-Path $PSScriptRoot -Parent) 'infra\azure\apps.bicep'
     $RevisionSuffix = "$($ReleaseTag.Substring(0, 7))-$([datetime]::UtcNow.ToString('yyyyMMddHHmmss'))"
-    $DeploymentParameters = @()
-    if ($ParametersFile) { $DeploymentParameters += "@$((Resolve-Path $ParametersFile).Path)" }
-    $DeploymentParameters += @(
-        "prefix=$Prefix", "releaseTag=$ReleaseTag", "revisionSuffix=$RevisionSuffix", "entraClientId=$EntraClientId",
-        "entraTenantId=$EntraTenantId", 'isWebExternal=false'
+    $VariableArguments = @(
+        "-var-file=$((Resolve-Path $ParametersFile).Path)",
+        "-var=resource_group_name=$ResourceGroup", "-var=prefix=$Prefix",
+        "-var=release_tag=$ReleaseTag", "-var=revision_suffix=$RevisionSuffix",
+        "-var=entra_client_id=$EntraClientId", "-var=entra_tenant_id=$EntraTenantId"
     )
-    $Base = @('deployment', 'group')
-    Invoke-AzJson ($Base + @('what-if', '-g', $ResourceGroup, '-f', $Template,
-        '--parameters') + $DeploymentParameters + @('shouldDeployApps=true')) | Out-Null
+    Invoke-Terraform @('validate', '-no-color')
+    $Preview = Invoke-AcaPlan -VariableArguments $VariableArguments
     if ($Operation -eq 'Preview') {
         return [pscustomobject]@{ operation = 'Preview'; releaseTag = $ReleaseTag }
     }
@@ -144,8 +190,7 @@ function Invoke-AcaRelease {
         }
     }
     if ($Previous.Count -gt 0) {
-        $StorageName = Invoke-AzJson @('deployment', 'group', 'show', '-g', $ResourceGroup,
-            '-n', "$Prefix-foundation", '--query', 'properties.outputs.storageName.value')
+        $StorageName = $Preview.planned_values.outputs.storage_name.value
         if (-not $StorageName) { throw 'Foundation storage output is missing; cannot snapshot before release.' }
         $Snapshots = foreach ($Share in @('data', 'models', 'reports')) {
             Invoke-AzJson @('storage', 'share-rm', 'snapshot', '-g', $ResourceGroup,
@@ -155,8 +200,7 @@ function Invoke-AcaRelease {
         if ($StatePath) { $State | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StatePath -Encoding utf8 }
     }
     if ($Operation -eq 'Deploy') {
-        Invoke-AzJson ($Base + @('create', '-g', $ResourceGroup, '-n', "$Prefix-init",
-            '-f', $Template, '--parameters') + $DeploymentParameters + @('shouldDeployApps=false')) | Out-Null
+        Invoke-AcaPlan -VariableArguments $VariableArguments -InitOnly -Apply | Out-Null
         $Execution = Invoke-AzJson @('containerapp', 'job', 'start', '-g', $ResourceGroup, '-n', "$Prefix-db-init")
         $Deadline = [datetime]::UtcNow.AddMinutes(12)
         do {
@@ -168,12 +212,11 @@ function Invoke-AcaRelease {
             Start-Sleep -Seconds 10
         } while ($true)
     }
-    Invoke-AzJson ($Base + @('create', '-g', $ResourceGroup, '-n', "$Prefix-apps",
-        '-f', $Template, '--parameters') + $DeploymentParameters + @('shouldDeployApps=true')) | Out-Null
+    Invoke-AcaPlan -VariableArguments $VariableArguments -Apply | Out-Null
     foreach ($Kind in @('api', 'web', 'worker')) { Wait-AcaReady "$Prefix-$Kind" -RevisionSuffix $RevisionSuffix }
     $Web = Invoke-AzJson @('containerapp', 'show', '-g', $ResourceGroup, '-n', "$Prefix-web")
     $Config = Invoke-AzJson @('rest', '--method', 'get', '--url',
-        "$($Web.id)/authConfigs/current?api-version=2026-07-01")
+        "$($Web.id)/authConfigs/current?api-version=2025-07-01")
     if (-not $Config.properties.platform.enabled -or
         $Config.properties.globalValidation.unauthenticatedClientAction -ne 'Return401' -or
         -not $Config.properties.identityProviders.azureActiveDirectory.enabled -or
