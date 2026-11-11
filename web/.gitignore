@@ -1,0 +1,7 @@
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+public/fonts/
+public/data/runs/*
+!public/data/runs/demo.json

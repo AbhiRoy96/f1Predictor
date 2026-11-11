@@ -1,0 +1,12 @@
+[
+  {
+    "id": "demo",
+    "event_name": "S\u00e3o Paulo Grand Prix",
+    "year": 2026,
+    "session": "race",
+    "stage": "post_quali",
+    "model_version": "illustrative_sample",
+    "demo": true,
+    "prediction_generated_at_utc": "2026-11-11T07:10:50.268905+00:00"
+  }
+]

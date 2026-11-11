@@ -41,6 +41,7 @@ pre-session cutoff and reserve actual results for evaluation.
 * [Models and simulation](#models-and-simulation)
 * [Evaluation and uncertainty](#evaluation-and-uncertainty)
 * [Streamlit dashboard](#streamlit-dashboard)
+* [Next.js web app](#nextjs-web-app)
 * [Architecture and repository layout](#architecture-and-repository-layout)
 * [Generated artifacts](#generated-artifacts)
 * [Tests](#tests)
@@ -530,6 +531,43 @@ Wikipedia/Wikimedia enrichment helpers support contextual profiles and media.
 Keep presentation enrichment separate from prediction evidence, and verify
 media licensing before reuse.
 
+## Next.js web app
+
+[web/](./web/) is **Gridcast**, a Next.js (App Router) and Tailwind CSS front end styled after
+the F1 TV look: dark track palette, red accents, italic display headings, and
+card rails. It is an unofficial fan interface and uses no official logos, fonts,
+or images. It shows only values from saved model output, so it omits the
+hard-coded driver statistics, weather, and leaderboards of the Streamlit
+prototype. Pages cover home, predictions (sortable table, finishing-position
+heatmap, scenarios), drivers, teams, circuit, model lab, and method.
+
+The app reads JSON exported from saved artifacts. Python writes it; Node never
+touches Parquet:
+
+```powershell
+python main.py race 2026 "Brazilian Grand Prix"
+python -m scripts.export_web_data --demo
+cd web
+npm install
+npm run dev
+```
+
+Open <http://localhost:3000>. Headings use Noto Sans. If you hold a licence for
+Formula1 Display, place `Formula1-Display-Bold.woff2` (or `.otf`) in
+`web/public/fonts/` and the headings use it automatically; the folder is
+git-ignored, so the font is never committed. The export writes one JSON file per saved
+prediction in `web/public/data/runs/`, replays every scenario through the
+production simulator, attaches matching walk-forward reports, and writes a
+manifest. Use `--output`, `--predictions-dir`, and `--reports-dir` to change
+locations. `--demo` appends an *illustrative sample* built from invented driver
+strengths; every page labels it, and it is never a forecast. Without `--demo`
+and without saved runs, the export exits with code 1 and the app shows an empty
+state. Select a saved run with the `?run=<id>` query parameter or the run picker.
+
+The Model Lab page contains the measured pre-fix walk-forward scoreboard as a
+fixed reference. Re-run `evaluate` and re-export to display current reports.
+Run `npm run build` and `npm run typecheck` before publishing changes.
+
 ## Architecture and repository layout
 
 ```mermaid
@@ -559,6 +597,8 @@ flowchart TD
 | [src/visualization](./src/visualization/)                     | Circuit and telemetry visualization helpers           |
 | [src/utils/config.py](./src/utils/config.py)                  | Runtime paths, feature exclusions, shared constants   |
 | [app](./app/)                                                 | Streamlit entry point and analytics pages             |
+| [web](./web/)                                                 | Next.js and Tailwind CSS front end                    |
+| [scripts](./scripts/)                                         | Feature audit and web data export                     |
 | [tests](./tests/)                                             | Unit and integration coverage                         |
 | [.github/workflows/tests.yml](./.github/workflows/tests.yml)  | Python 3.12 CI using unittest discovery               |
 
