@@ -2,6 +2,7 @@
 
 import json
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
@@ -10,6 +11,7 @@ from requests.adapters import HTTPAdapter
 from sqlalchemy import select
 from urllib3.util.retry import Retry
 
+from backend.credentials import collection_credentials
 from backend.db import save_run, seasons, upsert, utcnow
 
 JOLPICA = "https://api.jolpi.ca/ergast/f1"
@@ -117,7 +119,8 @@ def execute_job(engine, job: dict) -> str | None:
     from scripts.export_web_data import _reports, build_run
 
     # Reuse the CLI pipeline; its leakage guards, artifacts and model selection remain intact.
-    frame = run_pipeline(**job["payload"])
+    with nullcontext() if job["payload"].get("skip_collection") else collection_credentials(engine):
+        frame = run_pipeline(**job["payload"])
     run_id = job["id"]
     payload = build_run(frame, run_id, _reports(frame.iloc[0], Path("reports")))
     with engine.begin() as connection:

@@ -173,7 +173,7 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(job["payload"], {"year": 2024})
             self.assertEqual(job["status"], "queued")
             self.assertIsNone(job["trace_context"])
-            self.assertEqual(connection.scalars(select(schema_versions.c.version)).all(), [1, 2, 3])
+            self.assertEqual(connection.scalars(select(schema_versions.c.version)).all(), [1, 2, 3, 4])
 
     def test_disabled_gpu_has_no_invented_measurements(self):
         runtime = RuntimeMetrics(Mock())

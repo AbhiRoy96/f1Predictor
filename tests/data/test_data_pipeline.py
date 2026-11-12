@@ -6,8 +6,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from src.data import collect_season
-from src.data import collect_driver_constructor_stats
+from src.data import collect_driver_constructor_stats, collect_season
 from src.features.engineer_features import build_features
 
 
@@ -167,17 +166,23 @@ class CollectionTests(unittest.TestCase):
             )
             with patch.object(collect_season, "CACHE", Path(directory)), patch.object(
                 collect_season, "_CACHE_ENABLED", False
-            ), patch.object(collect_season.fastf1, "Cache", configure):
+            ), patch.object(collect_season.fastf1, "Cache", configure), patch.object(
+                collect_season, "install_request_budget"
+            ) as install:
                 collect_season._enable_cache()
             configure.configure.assert_called_once_with(cache_dir=directory)
             configure.enable_cache.assert_not_called()
+            install.assert_called_once_with(configure, Path(directory))
 
             legacy = SimpleNamespace(enable_cache=unittest.mock.Mock())
             with patch.object(collect_season, "CACHE", Path(directory)), patch.object(
                 collect_season, "_CACHE_ENABLED", False
-            ), patch.object(collect_season.fastf1, "Cache", legacy):
+            ), patch.object(collect_season.fastf1, "Cache", legacy), patch.object(
+                collect_season, "install_request_budget"
+            ) as install:
                 collect_season._enable_cache()
             legacy.enable_cache.assert_called_once_with(directory)
+            install.assert_called_once_with(legacy, Path(directory))
 
     def test_cli_defaults_to_configured_seasons(self):
         with patch.object(collect_season, "collect_season") as collect_year, patch.object(

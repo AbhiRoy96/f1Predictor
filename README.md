@@ -1,15 +1,42 @@
----
-title: Gridcast
-description: Point-in-time race forecasting and an authenticated analytical workspace.
----
+# Gridcast — Formula 1 Forecasting & Telemetry Platform
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+> Point-in-time probabilistic machine learning, Bayesian driver modeling, Monte Carlo simulation, and an authenticated analytical workspace for Formula 1.
+
+[![CI Pipeline](https://github.com/AbhiRoy96/f1Predictor/actions/workflows/tests.yml/badge.svg)](https://github.com/AbhiRoy96/f1Predictor/actions/workflows/tests.yml)
+[![Security Scan](https://github.com/AbhiRoy96/f1Predictor/actions/workflows/security.yml/badge.svg)](https://github.com/AbhiRoy96/f1Predictor/actions/workflows/security.yml)
+[![Python 3.11 | 3.12](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=next.js&logoColor=white)](https://nextjs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](./compose.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![CI Tests](https://github.com/AbhiRoy96/f1Predictor/actions/workflows/tests.yml/badge.svg)](./.github/workflows/tests.yml)
 
 A high-utility, point-in-time Formula 1 forecasting system and web platform combining Bayesian and XGBoost driver/constructor strength modeling, Monte Carlo race simulation, rigorous chronological evaluation, and an interactive full-stack workspace called **Gridcast**.
 
 Forecasts produce probabilistic estimates for race wins, podiums, top-10 finishes, retirements (DNF), and final finishing positions.
+
+---
+
+## Interface Preview
+
+### Race Intelligence Dashboard
+![Gridcast Race Intelligence](./screenshots/Gridcast%20Race%20Intelligence%20for%20Formula%201%20%28unofficial%29.png)
+*Interactive race telemetry, telemetry analysis, weather conditions, and circuit overview.*
+
+### Probabilistic Predictions & Finishing Forecasts
+![Gridcast Predictions](./screenshots/Gridcast%20-%20Predictions.png)
+*Simulated finishing probabilities, win/podium/top-10 likelihoods, and projected point spreads.*
+
+### Model Performance & Calibration Analytics
+![Gridcast Model Analytics](./screenshots/Gridcast%20-Model.png)
+*Brier score calibration curves, log-loss breakdowns, and feature importance distributions.*
+
+### Seasons & Historical Results
+![Gridcast Seasons](./screenshots/Gridcast%20-%20Seasons.png)
+*Comprehensive historical season navigation, qualifying grids, and race result breakdowns.*
+
+### Workspace Settings & Environment
+![Gridcast Settings](./screenshots/Gridcast%20-%20Settings.png)
+*FastF1 credential configuration, Fernet encryption key management, and runtime settings.*
 
 ---
 
@@ -73,6 +100,36 @@ Launch Gridcast (Next.js), the Flask API, PostgreSQL, and Grafana in containeriz
    - **Gridcast Dashboard**: [http://localhost:3000](http://localhost:3000)
    - **Grafana Monitoring**: [http://localhost:3001/d/gridcast-overview](http://localhost:3001/d/gridcast-overview)
    - **Flask API**: [http://localhost:5000](http://localhost:5000)
+
+### Optional first-run F1 account setup
+
+Open [Settings](http://localhost:3000/settings) to configure an F1 account before
+your first prediction. FastF1 attempts anonymous access when no account is available;
+the missing-credentials warning alone does not mean collection failed.
+
+Generate a server-side encryption key using the Python environment from step 1:
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Set `CREDENTIALS_ENCRYPTION_KEY` in your local `.env`, then run
+`docker compose up --build -d` to migrate the database and recreate the API and
+worker with the same key. Enter your F1 username and password in Settings and select
+**Save F1 account**. The account is shared by this private installation. Both fields
+are encrypted in PostgreSQL; the UI receives configuration status, never saved
+credentials. Saving does not validate sign-in: FastF1 attempts authentication during
+the next collection job, unless it reuses a cached sign-in token. Already-running
+jobs keep their current credentials.
+
+Keep the encryption key separate from database backups. Losing or changing it
+requires restoring the original key or saving the account again. Removing the saved
+account removes its database record, not any tokens already cached by FastF1.
+Alternatively, set `F1_USERNAME` and `F1_PASSWORD` in the server environment (Compose
+forwards these from `.env`). A saved account takes precedence for web collection
+jobs. The standalone Python CLI uses environment credentials, not the web database.
+Hosted mode disables account editing and ignores database credentials; administrators
+must provision environment secrets there. Never expose the local installation publicly.
 
 > [!IMPORTANT]
 > This setup is designed for private, local analytical use. Published services bind to `localhost` and Grafana defaults to anonymous admin access. Do not expose without implementing network authentication and access controls.

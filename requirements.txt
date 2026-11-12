@@ -16,6 +16,7 @@ gunicorn>=23,<24; sys_platform != "win32"
 joblib
 pyarrow
 requests
+cryptography>=46,<51
 opentelemetry-sdk>=1.38,<2
 opentelemetry-exporter-otlp-proto-http>=1.38,<2
 opentelemetry-instrumentation-flask>=0.59b0,<1

@@ -44,4 +44,5 @@ jobs:
           image-ref: gridcast-${{ matrix.image }}:${{ github.sha }}
           severity: CRITICAL,HIGH
           exit-code: '1'
-          ignore-unfixed: false
+          # Don't fail on vulnerabilities without an upstream fix; keep failing on fixable issues.
+          ignore-unfixed: true

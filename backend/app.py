@@ -16,6 +16,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import HTTPException
 
+from backend.credentials import CredentialsError, account_status, save_account
 from backend.db import (
     jobs,
     make_engine,
@@ -66,6 +67,11 @@ def create_app(config: dict | None = None) -> Flask:
     def database_error(error):
         app.logger.exception("Database request failed")
         return jsonify(error="Database unavailable or schema missing. Check backend logs and run db-init."), 503
+
+    @app.errorhandler(CredentialsError)
+    def credentials_error(error):
+        app.logger.error("F1 credential configuration failed: %s", error)
+        return jsonify(error=str(error)), 503
 
     @app.errorhandler(Exception)
     def unexpected_error(error):
@@ -142,7 +148,16 @@ def create_app(config: dict | None = None) -> Flask:
         with engine.connect() as connection:
             saved = connection.scalar(select(settings.c.payload).where(settings.c.id == 1))
         return jsonify(values=saved or DEFAULTS, choices=CHOICES, limits=LIMITS,
-                       credentials_required=False)
+                       credentials_required=False,
+                       f1_account=account_status(engine, hosted=app.config["HOSTED_MODE"]))
+
+    @app.put("/api/settings/f1-account")
+    def put_f1_account():
+        if app.config["HOSTED_MODE"]:
+            return jsonify(error="F1 account editing is disabled in hosted mode. Use administrator-managed secrets."), 403
+        save_account(engine, request.get_json())
+        app.logger.info("Saved F1 account configuration updated")
+        return jsonify(f1_account=account_status(engine, hosted=False))
 
     @app.put("/api/settings")
     def put_settings():
