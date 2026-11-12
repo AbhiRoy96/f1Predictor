@@ -1,8 +1,12 @@
 """Process resource metrics and optional NVIDIA NVML device telemetry."""
 
 import logging
+import resource
 
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 from opentelemetry.metrics import Observation
 
 logger = logging.getLogger(__name__)
@@ -10,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class RuntimeMetrics:
     def __init__(self, meter, gpu_enabled: bool = False):
-        self.process = psutil.Process()
+        self.process = psutil.Process() if psutil is not None else None
         self.nvml = None
         self.handles = []
         self.warned = set()
@@ -42,14 +46,24 @@ class RuntimeMetrics:
                                           callbacks=[self.gpu_callback(name)])
 
     def memory(self, _):
-        return [Observation(self.process.memory_info().rss)]
+        if self.process is not None:
+            return [Observation(self.process.memory_info().rss)]
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # On macOS ru_maxrss is in bytes; on Linux in kilobytes
+        mem = usage.ru_maxrss if usage.ru_maxrss > 1000000 else usage.ru_maxrss * 1024
+        return [Observation(max(1, mem))]
 
     def cpu(self, _):
-        times = self.process.cpu_times()
-        return [Observation(times.user + times.system)]
+        if self.process is not None:
+            times = self.process.cpu_times()
+            return [Observation(times.user + times.system)]
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return [Observation(usage.ru_utime + usage.ru_stime)]
 
     def threads(self, _):
-        return [Observation(self.process.num_threads())]
+        if self.process is not None:
+            return [Observation(self.process.num_threads())]
+        return [Observation(1)]
 
     def cost_configured(self, _):
         from src.observability.operations import compute_rate
