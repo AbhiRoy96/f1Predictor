@@ -598,8 +598,13 @@ def run_pipeline(session, year, event, measure_variation=False, *, stage="post_q
 def main(argv=None):
     configure("gridcast-cli")
     from src.models.race_model import DEFAULT_STRENGTH_MODEL, STRENGTH_MODELS
+    from src.utils.version import calculate_version
 
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {"version", "--version", "-v"}:
+        info = calculate_version()
+        print(f"Gridcast {info.semver} ({info.branch}) [{info.commit_short}]")
+        return info
     action = arguments.pop(0) if arguments and arguments[0] in {"train", "predict", "evaluate"} else "auto"
     parser = argparse.ArgumentParser(description="Train, predict or evaluate an F1 session")
     parser.add_argument("session", choices=SESSION_TYPES)

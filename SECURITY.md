@@ -4,12 +4,13 @@ Maintaining the security and reliability of this project protects users, data pi
 
 ## Supported Versions
 
-Security updates and patches are applied to the latest code on the default branch (`master`).
+Security updates and patches are applied to the latest code on the default branch (`main`) and active maintenance branches.
 
-| Version / Branch | Supported          |
-| ---------------- | ------------------ |
-| `master`         | :white_check_mark: |
-| Older releases   | :x:                |
+| Version / Branch            | Supported          |
+| --------------------------- | ------------------ |
+| `main` (current release n)  | :white_check_mark: |
+| `maintenance/v0.1` (n-1)    | :white_check_mark: |
+| Older releases              | :x:                |
 
 ## Reporting a Vulnerability
 

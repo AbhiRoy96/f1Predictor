@@ -83,10 +83,24 @@ Root-level [data](./data/), [models](./models/) and [reports](./reports/) contai
 generated runtime artifacts, not Python modules. Keep their paths unchanged when
 organizing documentation or tests.
 
+## Branching Strategy & Automatic Versioning
+
+The project adheres to a structured branching model:
+- `main`: Current production / release trunk (`n`).
+- `maintenance/v<major>.<minor>`: Long-term maintenance branch for prior releases (`n-1`).
+- `release/v<major>.<minor>.<patch>`: Pre-release hardening candidates.
+- `feature/<name>` or `dev-*`: In-development feature branches.
+- `experiment/<name>` or `research/*`: In-research machine learning experiments.
+
+Dynamic version identifiers (SemVer and PEP 440) are automatically calculated based on branch classification. For complete specifications, see the [Branching Strategy Guide](./docs/branching_strategy.md).
+
 ## Pull Request Process
 
-1. Create a descriptive feature branch (`feature/your-improvement` or `fix/issue-description`).
+1. Create a descriptive branch according to the taxonomy above (e.g. `feature/your-improvement`, `fix/issue-description`, or `experiment/model-hypothesis`).
 2. Make focused, atomic commits with clear messages.
-3. Ensure all existing and new tests pass.
-4. Submit a Pull Request targeting the `master` branch.
+3. Ensure all existing and new tests pass:
+   ```bash
+   python -m unittest discover -s tests
+   ```
+4. Submit a Pull Request targeting the `main` branch (or active `maintenance/*` branch for patch backports).
 5. Provide a clear summary in your PR description detailing the problem solved, changes made, and validation results.
