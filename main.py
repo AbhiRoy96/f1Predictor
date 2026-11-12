@@ -13,20 +13,25 @@ import numpy as np
 import pandas as pd
 
 from src.data.collect_driver_constructor_stats import collect_driver_constructor_stats
-from src.data.collect_season import _resolve_event, _session_specs, collect_event
+from src.data.collect_season import (
+    _enable_cache,
+    _resolve_event,
+    _session_specs,
+    collect_event,
+)
 from src.data.event_selection import (
     DEFAULT_EVENTS_PER_SEASON,
     select_related_events,
     similar_circuit_keys,
 )
 from src.data.normalise_entities import normalise_driver_name
-from src.models.artifacts import dump_artifact, load_artifact
 from src.data.validate_data import validate_features_df
 from src.features.engineer_features import build_features, load_results
-from src.utils.config import PREDICTIONS_DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
-from src.utils.logging import setup_logger
+from src.models.artifacts import dump_artifact, load_artifact
 from src.observability.operations import observe, record_evaluation
 from src.observability.telemetry import configure
+from src.utils.config import PREDICTIONS_DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
+from src.utils.logging import setup_logger
 
 logger = setup_logger("f1_orchestrator")
 HISTORICAL_START_YEAR = 2021
@@ -70,6 +75,7 @@ def collect_historical_data(year: int, event: str, events_per_season=DEFAULT_EVE
         raise ValueError(f"Target year must be {HISTORICAL_START_YEAR} or later.")
     if isinstance(events_per_season, bool) or not isinstance(events_per_season, int) or events_per_season < 1:
         raise ValueError("events_per_season must be a positive integer")
+    _enable_cache()
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     target_schedule = fastf1.get_event_schedule(year, include_testing=False)
     target = _resolve_event(target_schedule, year, event)

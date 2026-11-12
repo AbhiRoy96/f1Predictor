@@ -1,9 +1,9 @@
 """Results-only collection and elapsed-day form windows without live downloads."""
 
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -15,7 +15,7 @@ from tests.data.test_data_pipeline import _result
 
 
 class ResultsOnlyTests(unittest.TestCase):
-    def test_results_only_paces_retries_and_respects_retry_after(self):
+    def test_results_only_retries_and_respects_retry_after(self):
         response = requests.Response()
         response.status_code = 429
         response.headers["Retry-After"] = "4"
@@ -24,7 +24,7 @@ class ResultsOnlyTests(unittest.TestCase):
         with patch.object(collect_season.time, "sleep") as sleep:
             collect_season._load_session(session, True)
         self.assertEqual(session.load.call_count, 2)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 4, 1])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [4])
         session.load = Mock(side_effect=requests.Timeout("upstream timeout"))
         with patch.object(collect_season.time, "sleep"), self.assertRaises(requests.Timeout):
             collect_season._load_session(session, True)

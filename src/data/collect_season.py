@@ -1,8 +1,7 @@
 ﻿import argparse
 import os
-import time
-from email.utils import parsedate_to_datetime
 import re
+import time
 import unicodedata
 from pathlib import Path
 
@@ -11,6 +10,7 @@ import pandas as pd
 import requests
 
 from src.data import collect_driver_constructor_stats
+from src.data.fastf1_transport import install_request_budget, retry_delay
 
 CACHE = Path(os.environ.get("FASTF1_CACHE_DIR", "data/cache/fastf1"))
 OUTPUT = Path("data/raw")
@@ -38,14 +38,13 @@ def _enable_cache():
             configure(cache_dir=str(CACHE))
         else:
             fastf1.Cache.enable_cache(str(CACHE))
+        install_request_budget(fastf1.Cache, CACHE)
         _CACHE_ENABLED = True
 
 
 def _load_session(session, results_only):
-    """Keep FastF1's cached/rate-limited transport and pace whole-calendar loads."""
-    for attempt in range(3 if results_only else 1):
-        if results_only:
-            time.sleep(1)
+    """Retry transient failures in both detailed and results-only collection."""
+    for attempt in range(3):
         try:
             session.load(laps=not results_only, telemetry=False, weather=not results_only,
                          messages=not results_only)
@@ -54,16 +53,11 @@ def _load_session(session, results_only):
             response = getattr(exc, "response", None)
             status = getattr(response, "status_code", None)
             transient = isinstance(exc, (requests.ConnectionError, requests.Timeout)) or status in {429, 500, 502, 503, 504}
-            if not results_only or not transient or attempt == 2:
+            if not transient or attempt == 2:
                 raise
             delay = 2 ** attempt
-            retry_after = response.headers.get("Retry-After") if response is not None else None
-            if retry_after:
-                try:
-                    delay = max(delay, float(retry_after))
-                except ValueError:
-                    until = pd.Timestamp(parsedate_to_datetime(retry_after))
-                    delay = max(delay, (until - pd.Timestamp.now(tz="UTC")).total_seconds())
+            if response is not None:
+                delay = retry_delay(response, delay)
             if delay > 300:
                 raise RuntimeError("Upstream Retry-After exceeds this collection attempt; retry later") from exc
             time.sleep(delay)

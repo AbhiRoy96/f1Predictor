@@ -492,8 +492,17 @@ The identity includes year, event, session, stage, strength model and seed.
 Changing only simulation count or collection options does not create an active duplicate.
 
 Season sync is single-flight across the queue, with a one-hour interval per season.
-Upstream requests are spaced by one second and retry transient failures with
-exponential backoff and `Retry-After`. Database-backed write throttles permit
+FastF1 cache misses are spaced by at least one second, with rolling-hour budgets
+of 180 Jolpica requests and 450 total requests, below FastF1's native limits.
+The budget and upstream `Retry-After` cooldowns persist in the FastF1 cache
+directory and are shared by collectors using that directory, including across
+restarts. Cached responses do not consume the budget. HTTP 429 responses retry
+at the transport layer; both detailed and results-only loads retry transient
+network failures with exponential backoff. Exhausting an hourly budget waits
+for capacity rather than continuing to send requests. Keep the cache persistent
+and shared between collectors; separate cache directories or other clients
+sharing your public IP cannot be coordinated by this guard.
+Database-backed write throttles permit
 twenty requests per minute per user and client-address pseudonym across API replicas.
 Job listings expose only the current user's jobs; forecasts and settings are shared.
 
