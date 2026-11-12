@@ -6,8 +6,16 @@ export default function PrivacyPage() {
       <PageHeader eyebrow="Privacy" title="What Gridcast stores" />
       <div className="mt-8 max-w-3xl space-y-4 text-sm leading-relaxed text-fog">
         <p>
-          Hosted access uses Microsoft Entra sign-in. Gridcast does not store passwords or access tokens in its
+          Hosted access uses Microsoft Entra sign-in. Gridcast does not store Entra passwords or access tokens in its
           database. The hosting platform validates your sign-in before requests reach the web application.
+        </p>
+        <p>
+          In private local installations, you can optionally save a Formula 1 account in Settings.
+          The username and password are encrypted in PostgreSQL with a separate server-side encryption key
+          and are shared by local collection jobs. Saved credentials are never returned to the browser.
+          Remove the saved account in Settings to delete its database record; FastF1 may retain cached
+          sign-in tokens separately. Database backups may retain encrypted records until the operator removes them.
+          Hosted deployments disable this account editor and use administrator-managed environment secrets instead.
         </p>
         <p>
           Job records store a SHA-256 pseudonym of your platform account ID to enforce queue limits and let you

@@ -95,6 +95,15 @@ export interface SettingsResponse {
   choices: Record<"session" | "stage" | "strength_model", string[]>;
   limits: Record<"n_simulations" | "seed" | "events_per_season", [number, number]>;
   credentials_required: boolean;
+  f1_account: F1AccountStatus;
+}
+
+export interface F1AccountStatus {
+  configured: boolean;
+  source: "database" | "environment" | "none";
+  editable: boolean;
+  hosted: boolean;
+  error: string | null;
 }
 
 export interface Job {

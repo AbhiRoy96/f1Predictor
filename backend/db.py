@@ -43,6 +43,11 @@ settings = Table(
     Column("id", Integer, primary_key=True),
     Column("payload", json_type, nullable=False),
 )
+provider_credentials = Table(
+    "provider_credentials", metadata,
+    Column("provider", String(32), primary_key=True),
+    Column("ciphertext", Text, nullable=False),
+)
 jobs = Table(
     "jobs", metadata,
     Column("id", String(36), primary_key=True),
@@ -88,7 +93,7 @@ def migrate(engine: Engine) -> None:
     metadata.create_all(engine)
     with engine.begin() as connection:
         version = connection.scalar(select(func.max(schema_versions.c.version))) or 0
-        if version > 3:
+        if version > 4:
             raise RuntimeError("Database schema is newer than this application supports.")
         if version < 2:
             columns = {column["name"] for column in inspect(connection).get_columns("jobs")}
@@ -105,6 +110,8 @@ def migrate(engine: Engine) -> None:
                     connection.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {kind}"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_request_key ON jobs (request_key)"))
             connection.execute(schema_versions.insert().values(version=3))
+        if version < 4:
+            connection.execute(schema_versions.insert().values(version=4))
 
 
 def upsert(connection, table: Table, key: dict, values: dict) -> None:

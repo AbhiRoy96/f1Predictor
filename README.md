@@ -74,6 +74,36 @@ Launch Gridcast (Next.js), the Flask API, PostgreSQL, and Grafana in containeriz
    - **Grafana Monitoring**: [http://localhost:3001/d/gridcast-overview](http://localhost:3001/d/gridcast-overview)
    - **Flask API**: [http://localhost:5000](http://localhost:5000)
 
+### Optional first-run F1 account setup
+
+Open [Settings](http://localhost:3000/settings) to configure an F1 account before
+your first prediction. FastF1 attempts anonymous access when no account is available;
+the missing-credentials warning alone does not mean collection failed.
+
+Generate a server-side encryption key using the Python environment from step 1:
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Set `CREDENTIALS_ENCRYPTION_KEY` in your local `.env`, then run
+`docker compose up --build -d` to migrate the database and recreate the API and
+worker with the same key. Enter your F1 username and password in Settings and select
+**Save F1 account**. The account is shared by this private installation. Both fields
+are encrypted in PostgreSQL; the UI receives configuration status, never saved
+credentials. Saving does not validate sign-in: FastF1 attempts authentication during
+the next collection job, unless it reuses a cached sign-in token. Already-running
+jobs keep their current credentials.
+
+Keep the encryption key separate from database backups. Losing or changing it
+requires restoring the original key or saving the account again. Removing the saved
+account removes its database record, not any tokens already cached by FastF1.
+Alternatively, set `F1_USERNAME` and `F1_PASSWORD` in the server environment (Compose
+forwards these from `.env`). A saved account takes precedence for web collection
+jobs. The standalone Python CLI uses environment credentials, not the web database.
+Hosted mode disables account editing and ignores database credentials; administrators
+must provision environment secrets there. Never expose the local installation publicly.
+
 > [!IMPORTANT]
 > This setup is designed for private, local analytical use. Published services bind to `localhost` and Grafana defaults to anonymous admin access. Do not expose without implementing network authentication and access controls.
 

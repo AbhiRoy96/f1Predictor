@@ -503,7 +503,7 @@ port 5432. Each production job runs in a bounded subprocess with a heartbeat;
 On Linux, timeout or loss of the worker lock terminates the entire job process group.
 Interrupted jobs fail visibly and are not silently retried.
 
-Run schema v3 migrations only through `db-init`, before deploying API and worker
+Run schema v4 migrations only through `db-init`, before deploying API and worker
 images. Existing jobs without an owner remain administrative records and are not
 shown in user job lists. `pg_stat_statements` is optional: configure it on the server
 and set `ENABLE_PG_STAT_STATEMENTS=true` on the init job if database profiling is needed.
@@ -535,8 +535,9 @@ curl -X POST http://localhost:3000/api/seasons/2024/sync -H "Content-Type: appli
 | `POST` | `/api/predictions` | Queue a new forecasting job. | `{"year": 2026, "event": "Brazilian Grand Prix", "stage": "post_quali"}` |
 | `GET` | `/api/jobs` | Monitor active and completed background jobs. | None |
 | `GET` | `/api/jobs/<id>` | Inspect specific job status and error logs. | None |
-| `GET` | `/api/settings` | Retrieve default prediction settings. | None |
+| `GET` | `/api/settings` | Retrieve default prediction settings and write-only F1 account status. | None |
 | `PUT` | `/api/settings` | Update global prediction defaults. | `{"n_simulations": 30000, "events_per_season": 8}` |
+| `PUT` | `/api/settings/f1-account` | Save an encrypted F1 account, or remove it (local mode only). Requires `CREDENTIALS_ENCRYPTION_KEY` to save. | `{"username": "<account>", "password": "<password>"}` or `{"clear": true}` |
 | `GET` | `/api/seasons/<year>` | Fetch synced season calendar and standings. | None |
 | `POST` | `/api/seasons/<year>/sync` | Trigger asynchronous season resync. | `{}` |
 
@@ -558,7 +559,7 @@ npm run dev
 * **`/predictions`**: Interactive probability matrices, driver head-to-head comparisons, position heatmaps, and counterfactual scenario selectors.
 * **`/seasons`**: Official championship calendars, session classifications, and driver/constructor standings.
 * **`/model-lab`**: Interactive walk-forward evaluation dashboards, Brier score leaderboards, and reliability diagrams.
-* **`/settings`**: Configure default simulation parameters, collection budgets, and active model variants.
+* **`/settings`**: Configure default simulation parameters, collection budgets, active model variants, and optional encrypted first-run F1 account credentials in private local mode. See [F1 account setup](../README.md#optional-first-run-f1-account-setup) for encryption-key configuration.
 * **`/privacy`**: Stored data, pseudonymous admission identities and retention responsibilities.
 * **`/health`**: Lightweight web probe. API readiness separately checks PostgreSQL.
 
