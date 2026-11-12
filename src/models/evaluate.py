@@ -245,7 +245,7 @@ def _baseline_strength(df, name):
 def _complete_race_metrics(frame):
     from scipy.stats import kendalltau
 
-    from src.models.calibrate import pl_nll
+    from src.models.calibrate import pl_nll, top10_pl_nll
 
     position = frame.target_position.to_numpy(float)
     if not np.array_equal(np.sort(position), np.arange(1, len(frame) + 1)):
@@ -271,6 +271,9 @@ def _complete_race_metrics(frame):
     finishers = order[frame.target_dnf.to_numpy()[order] == 0]
     conditional_nll = (pl_nll(frame.strength.to_numpy(), finishers, float(frame.pl_temperature.iloc[0]))
                        if len(finishers) > 1 else np.nan)
+    pl_top10 = (top10_pl_nll(frame.strength.to_numpy()[finishers], np.arange(len(finishers)),
+                           float(frame.pl_temperature.iloc[0])) / min(10, len(finishers))
+                if len(finishers) > 1 else np.nan)
     matrix = frame[[f"prob_p{i}" for i in range(1, len(frame) + 1)]].to_numpy(float)
     observed = np.arange(1, len(frame) + 1)[None, :] >= position[:, None]
     rps = np.mean(np.sum((matrix.cumsum(axis=1)[:, :-1] - observed[:, :-1]) ** 2, axis=1))
@@ -286,6 +289,7 @@ def _complete_race_metrics(frame):
         "top_3_overlap": float(len(np.intersect1d(predicted_top3, true_top3))),
         "spearman": float(spearman), "kendall_tau": float(kendall),
         "finisher_pl_nll_diagnostic": float(conditional_nll),
+        "conditional_top10_pl_nll": float(pl_top10),
         "position_log_loss": float(-np.log(np.clip(matrix[np.arange(len(frame)), position.astype(int) - 1], 1e-12, 1)).mean()),
         "position_rps": float(rps),
         "position_interval_80_coverage": float(((position >= frame.p10_position) & (position <= frame.p90_position)).mean()),
@@ -296,6 +300,8 @@ def _complete_race_metrics(frame):
         "dnf_brier": dnf_brier, "dnf_constant_brier": constant_brier,
         "dnf_brier_skill": float(dnf_skill),
         "top10_brier": float(np.mean((frame.top10_probability - top10) ** 2)),
+        "top10_log_loss": float(-np.mean(top10 * np.log(np.clip(frame.top10_probability, 1e-12, 1 - 1e-12))
+                                        + (~top10) * np.log1p(-np.clip(frame.top10_probability, 1e-12, 1 - 1e-12)))),
     }
 
 
@@ -310,8 +316,8 @@ def _mean_race_metrics(values, names):
     return means
 
 
-def bootstrap_race_metrics(metrics, seed=42):
-    """Circular race-block bootstrap, including paired differences versus grid."""
+def bootstrap_race_metrics(metrics, seed=42, best_baseline_metrics=None):
+    """Circular race-block bootstrap with aligned, paired baseline differences."""
     columns = ["model", "reference", "metric", "estimate", "ci_low", "ci_high", "n_races", "block_length"]
     if metrics.empty:
         return pd.DataFrame(columns=columns)
@@ -325,14 +331,21 @@ def bootstrap_race_metrics(metrics, seed=42):
         block = max(1, int(np.ceil(n ** (1 / 3))))
         starts = rng.integers(0, n, size=(500, int(np.ceil(n / block))))
         indices = ((starts[:, :, None] + np.arange(block)) % n).reshape(500, -1)[:, :n]
-        for against in ("absolute", "grid_difference"):
+        references = ["absolute", "grid_difference"]
+        if best_baseline_metrics is not None and model == "race_model":
+            references.append("best_baseline_difference")
+        for against in references:
             if against == "grid_difference" and model == "grid":
                 continue
             values = frame[names].to_numpy(float)
             estimate = _mean_race_metrics(values, names)
             means = _mean_race_metrics(values[indices], names)
-            if against == "grid_difference":
-                reference_values = reference.reindex(frame.index)[names].to_numpy(float)
+            if against != "absolute":
+                paired = (best_baseline_metrics.set_index("race_index")
+                          if against == "best_baseline_difference" else reference)
+                if not frame.index.isin(paired.index).all():
+                    raise ValueError("Paired comparisons require identical held-out races")
+                reference_values = paired.reindex(frame.index)[names].to_numpy(float)
                 estimate -= _mean_race_metrics(reference_values, names)
                 means -= _mean_race_metrics(reference_values[indices], names)
             for j, metric in enumerate(names):
@@ -343,7 +356,7 @@ def bootstrap_race_metrics(metrics, seed=42):
 
 
 def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=2000, seed=42,
-                          strength_model="legacy"):
+                          strength_model="legacy", window_months=None, evaluation_start=None):
     """Shared expanding folds, in memory only.
 
     Returns DataFrames: predictions (race model), baselines (long, model=grid/
@@ -352,7 +365,8 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
     Reliability target-specific aliases reliability_win/podium/top10/dnf are included.
     Position errors are predicted minus actual; rolling bias uses the latest five races.
     """
-    from src.models.calibrate import fit_simulation_temperature
+    from src.models.calibrate import fit_simulation_temperature, simulation_log_loss
+    from src.models.readiness import training_window
     from src.models.race_model import (
         RacePredictor,
         chronological_races,
@@ -374,12 +388,21 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
     train_end = None
     training_dnf_base_rate = np.nan
     fold = -1
+    best_names = {}
     for i in range(min_train_races, len(races)):
         test = df.iloc[races[i]].reset_index(drop=True)
+        if evaluation_start is not None and pd.to_datetime(test.SessionStartUtc, utc=True).min() < pd.to_datetime(evaluation_start, utc=True):
+            continue
         if "Abbreviation" in test:
             test = test.sort_values("Abbreviation").reset_index(drop=True)
-        if (i - min_train_races) % refit_every == 0:
+        if model is None or (i - min_train_races) % refit_every == 0:
             train = df.iloc[np.concatenate(races[:i])].reset_index(drop=True)
+            cutoff = pd.to_datetime(test.SessionStartUtc, utc=True).min()
+            if "FeatureCutoffUtc" in test:
+                cutoff = min(cutoff, pd.to_datetime(test.FeatureCutoffUtc, utc=True).min())
+            train = training_window(train, cutoff, window_months)
+            if len(chronological_races(train)) < 2:
+                raise ValueError("Window has fewer than two training races before the feature cutoff")
             model = RacePredictor(**({"strength_model": strength_model} if strength_model != "legacy" else {}))
             model.random_seed = seed
             model.fit(train)
@@ -394,13 +417,20 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
                 temperature = fit_simulation_temperature(examples, seed=seed)
                 baseline_calibration[name] = {"pl_temperature": temperature,
                                                "source": "same_forward_oof_final_simulation",
-                                               "train_races": i, "training_end": train_end}
+                                               "train_races": len(chronological_races(train)), "training_end": train_end,
+                                               "selection_loss": simulation_log_loss(examples, temperature, seed=seed)
+                                               if examples else np.inf}
+            selected = min(baseline_calibration, key=lambda name: baseline_calibration[name]["selection_loss"])
+            best_names[fold + 1] = selected
             fold += 1
-            folds.append({"fold": fold, "n_train_races": i,
+            folds.append({"fold": fold, "n_train_races": len(chronological_races(train)),
                           "train_groups": race_groups(train).drop_duplicates().tolist(),
                           "train_max_utc": train_end,
                           "test_min_utc": str(test.SessionStartUtc.min()) if "SessionStartUtc" in test else race_groups(test).iloc[0],
                           "baseline_calibration": baseline_calibration.copy(),
+                          "best_baseline": selected,
+                          "baseline_selection": "past_only_oof_calibration_objective",
+                          "best_baseline_selection_evidenced": bool(model.calibration_examples_),
                           "calibration_provenance": model.calibration_provenance_})
         prediction = model.predict(test, n_simulations=n_simulations, seed=seed + i)
         prediction["pl_temperature"] = model.pl_temperature_
@@ -457,6 +487,9 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
                 table["model"], table["target"] = name, target
                 reliability_frames.append(table)
     metrics = pd.DataFrame(metric_rows)
+    best_metrics = (metrics.loc[
+        metrics.model.eq(metrics.fold.map(best_names))].copy()
+        if not metrics.empty else pd.DataFrame())
     metric_names = [c for c in metrics if c not in {"model", "race_index", "fold", "Year", "RoundNumber"}]
     summary = pd.DataFrame([
         {"model": name, **dict(zip(metric_names, _mean_race_metrics(frame[metric_names].to_numpy(float), metric_names)))}
@@ -480,7 +513,10 @@ def run_race_walk_forward(df, min_train_races=8, refit_every=4, n_simulations=20
         bias[f"{kind}_bias"] = table
     result = {"predictions": predictions, "baselines": baselines, "metrics": metrics,
               "summary": summary, "folds": pd.DataFrame(folds), "reliability": reliability_table,
-              "confidence": bootstrap_race_metrics(metrics, seed), **bias}
+              "best_baseline_metrics": best_metrics,
+              "confidence": bootstrap_race_metrics(
+                  metrics, seed, best_metrics if not best_metrics.empty and all(
+                      fold["best_baseline_selection_evidenced"] for fold in folds) else None), **bias}
     for target in ["win", "podium", "top10", "dnf"]:
         result[f"reliability_{target}"] = reliability_table[reliability_table.target.eq(target)].reset_index(drop=True)
     return result

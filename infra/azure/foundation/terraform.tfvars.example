@@ -1,0 +1,5 @@
+resource_group_name    = "<staging-resource-group>"
+prefix                 = "gridcast"
+bootstrap_key_vault_id = "<bootstrap-key-vault-resource-id>"
+budget_contact_emails  = ["<operator-email>"]
+budget_start_date      = "<first-day-of-current-month-in-UTC>"

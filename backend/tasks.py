@@ -1,12 +1,17 @@
 """Explicit local imports, complete-season sync and production prediction jobs."""
 
 import json
+import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 from sqlalchemy import select
+from urllib3.util.retry import Retry
 
+from backend.credentials import collection_credentials
 from backend.db import save_run, seasons, upsert, utcnow
 
 JOLPICA = "https://api.jolpi.ca/ergast/f1"
@@ -54,8 +59,8 @@ def fetch_table(year: int, resource: str, table: str, collection: str) -> list[d
     output = []
     while True:
         suffix = f"/{resource}" if resource else ""
-        response = requests.get(f"{JOLPICA}/{year}{suffix}.json",
-                                params={"limit": 100, "offset": offset}, timeout=(10, 60))
+        response = fetch_page(f"{JOLPICA}/{year}{suffix}.json",
+                              params={"limit": 100, "offset": offset})
         response.raise_for_status()
         data = response.json()["MRData"]
         rows = data[table][collection]
@@ -76,6 +81,16 @@ def fetch_table(year: int, resource: str, table: str, collection: str) -> list[d
             merged[identity][key].extend(race[key])
         return list(merged.values())
     return output
+
+
+def fetch_page(url: str, *, params: dict):
+    """Retry transient upstream errors with exponential backoff and Retry-After."""
+    with requests.Session() as session:
+        session.mount("https://", HTTPAdapter(max_retries=Retry(
+            total=4, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods={"GET"}, respect_retry_after_header=True)))
+        time.sleep(1)
+        return session.get(url, params=params, timeout=(10, 60))
 
 
 def sync_season(engine, year: int) -> None:
@@ -104,7 +119,8 @@ def execute_job(engine, job: dict) -> str | None:
     from scripts.export_web_data import _reports, build_run
 
     # Reuse the CLI pipeline; its leakage guards, artifacts and model selection remain intact.
-    frame = run_pipeline(**job["payload"])
+    with nullcontext() if job["payload"].get("skip_collection") else collection_credentials(engine):
+        frame = run_pipeline(**job["payload"])
     run_id = job["id"]
     payload = build_run(frame, run_id, _reports(frame.iloc[0], Path("reports")))
     with engine.begin() as connection:

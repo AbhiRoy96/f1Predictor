@@ -72,7 +72,7 @@ class TestRaceModel(unittest.TestCase):
             self.assertLess(pd.Timestamp(fold["train_max_utc"]), pd.Timestamp(fold["validation_min_utc"]))
         self.assertEqual(provenance["weights_source"], "oof")
         self.assertEqual(provenance["pl_temperature_source"], "oof_final_simulation")
-        self.assertEqual(provenance["objective"], "final_win_plus_podium_log_loss")
+        self.assertEqual(provenance["objective"], "final_win_podium_top10_plus_conditional_top10_pl")
         self.assertEqual(self.model.temperature_, 1.0)
         self.assertAlmostEqual(sum(self.model.blend_weights_), 1)
         self.assertGreaterEqual(self.model.temperature_, 0.3)

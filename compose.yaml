@@ -16,6 +16,9 @@ x-backend: &backend
     PYROSCOPE_SERVER_ADDRESS: http://lgtm:4040
     ML_COMPUTE_HOURLY_USD: ${ML_COMPUTE_HOURLY_USD:-}
     GPU_METRICS_ENABLED: "false"
+    CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:-}
+    F1_USERNAME: ${F1_USERNAME:-}
+    F1_PASSWORD: ${F1_PASSWORD:-}
   volumes:
     - ./data:/app/data
     - ./models:/app/models

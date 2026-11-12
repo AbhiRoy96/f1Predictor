@@ -4,6 +4,8 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .env
+.env.*
+!.env.example
 data
 models
 reports
@@ -12,3 +14,4 @@ app
 tests
 *.txt
 !requirements.txt
+!requirements.lock

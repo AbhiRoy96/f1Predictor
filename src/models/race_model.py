@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
@@ -15,7 +14,8 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRanker
 
 from src.data.outcomes import dnf_labels
-from src.models.calibrate import fit_simulation_temperature
+from src.models.calibrate import CALIBRATION_OBJECTIVE, fit_simulation_temperature
+from src.models.artifacts import dump_artifact, library_versions, validate_library_versions
 from src.simulation.race_simulator import MonteCarloRaceSimulator, session_scenario
 from src.utils.config import METADATA_COLUMNS, get_feature_columns
 from src.utils.logging import setup_logger
@@ -74,14 +74,16 @@ def chronological_races(df):
     return [np.flatnonzero(groups == group) for group in races.group]
 
 
-def recency_weights(df):
-    """Thirty-event half-life; prior regulation eras retain one-quarter weight."""
+def recency_weights(df, half_life_days=365.25):
+    """Calendar-day half-life; prior regulation eras retain one-quarter weight."""
+    if half_life_days <= 0:
+        raise ValueError("half_life_days must be positive")
     races = chronological_races(df)
-    weights = np.empty(len(df), dtype=float)
+    starts = pd.to_datetime(df.SessionStartUtc, utc=True, errors="raise")
+    age_days = (starts.max() - starts).dt.total_seconds().to_numpy() / 86400
+    weights = np.exp2(-age_days / half_life_days)
     era = np.select([df.Year.ge(2026), df.Year.ge(2022)], [2026, 2022], default=2014)
     latest_era = era[races[-1][0]]
-    for i, rows in enumerate(races):
-        weights[rows] = 2 ** (-(len(races) - 1 - i) / 30)
     return weights * np.where(era == latest_era, 1, .25)
 
 
@@ -188,6 +190,10 @@ class RacePredictor:
         self.n_estimators = n_estimators
         self.oof_splits = oof_splits
         self.strength_model = strength_model
+
+    def __setstate__(self, state):
+        validate_library_versions(state.get("metadata_", {}))
+        self.__dict__.update(state)
 
     def _fit_strength(self, df, races):
         if self.strength_model in {"bayesian", "ensemble"}:
@@ -372,9 +378,10 @@ class RacePredictor:
                                         "folds": folds, "weights_source": "oof" if blended else "default",
                                         "temperature_source": "identity_single_final_scale",
                                         "pl_temperature_source": "oof_final_simulation" if blended else "default",
-                                        "objective": "final_win_plus_podium_log_loss",
+                                        "objective": CALIBRATION_OBJECTIVE,
                                         "calibration_simulations": 1024, "seed": self.random_seed}
         self.metadata_ = {"model_version": MODEL_VERSIONS[self.strength_model],
+                          "library_versions": library_versions(),
                           "strength_model": self.strength_model,
                           "n_train_races": len(races), "n_train_rows": len(ordered),
                           "training_start": str(ordered.SessionStartUtc.min()) if "SessionStartUtc" in ordered else race_groups(ordered).iloc[0],
@@ -383,7 +390,8 @@ class RacePredictor:
                           "blend_weights": self.blend_weights_.tolist(), "calibration_provenance": self.calibration_provenance_,
                           "dnf_labels": {k: v["n_labels"] for k, v in self.dnf_model_.models_.items()},
                           "strength_target": "conditional_finisher_order",
-                          "recency_policy": "30_event_half_life_prior_era_weight_0.25",
+                          "recency_policy": "365.25_day_half_life_prior_era_weight_0.25",
+                          "form_window_policy": "90_and_180_days_90_day_ewma",
                           "uncertainty_kind": "conditional_outcomes_not_parameter_confidence",
                           "scenario_scope": "standard_dry_calibrated_other_scenarios_heuristic",
                           "retirement_dependence": "shrunk_race_gaussian_copula_moment_estimate",
@@ -477,6 +485,11 @@ class RacePredictor:
             result["training_start"] = self.metadata_["training_start"]
             result["training_end"] = self.metadata_["training_end"]
             result["n_train_races"] = self.metadata_["n_train_races"]
+            result["calibration_oof_races"] = self.calibration_provenance_["n_races"]
+            result["calibration_races"] = self.calibration_provenance_["n_races"]
+            result["calibration_objective"] = self.calibration_provenance_["objective"]
+            result["recency_policy"] = self.metadata_["recency_policy"]
+            result["model_limitations"] = self.metadata_["limitations"]
             if "stage" not in result:
                 result["stage"] = "pre_weekend"
             result["_row"] = rows
@@ -497,5 +510,5 @@ def train_and_save_race_model(feature_path, output_dir, strength_model="legacy")
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "race_model.joblib"
     artifact = {"model": model, "feature_columns": model.feature_columns_, "metadata": model.metadata_}
-    joblib.dump(artifact, path)
+    dump_artifact(artifact, path)
     return {"model_path": path, "feature_columns": model.feature_columns_, "metadata": model.metadata_}

@@ -19,6 +19,9 @@ export default async function LabPage(props: PageProps) {
   const { run, manifest } = await loadRun(props);
   const summary = run?.reports.summary ?? [];
   const reliability = (run?.reports.reliability ?? []).filter((r) => r.model === "race_model" && r.target === "win");
+  const paired = (run?.reports.confidence ?? []).filter(
+    (row) => row.reference === "grid_difference" || row.reference === "best_baseline_difference",
+  );
 
   return (
     <>
@@ -119,6 +122,48 @@ export default async function LabPage(props: PageProps) {
           </div>
         </Section>
       )}
+
+      <Section eyebrow="Paired evidence" title="Margins against the baselines">
+        <p className="mb-4 text-sm text-fog">
+          Differences are model minus comparator on the same chronological held-out races. Negative differences
+          favor the model for losses; positive differences favor it for accuracy. The best baseline is selected
+          using earlier out-of-fold evidence only. An interval crossing zero does not establish an improvement.
+        </p>
+        {paired.length ? (
+          <div className="overflow-x-auto rounded-xl border border-line">
+            <table className="w-full min-w-[720px] text-left text-sm">
+              <thead className="bg-kerb text-fog">
+                <tr>
+                  {["Model", "Comparator", "Metric", "Difference", "Paired 95% interval", "Races"].map((label) => (
+                    <th key={label} className="px-4 py-3">{label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {paired.map((row, index) => (
+                  <tr key={index} className="border-t border-line bg-asphalt">
+                    <td className="px-4 py-3">{row.model}</td>
+                    <td className="px-4 py-3">{String(row.reference).replace("_difference", "").replaceAll("_", " ")}</td>
+                    <td className="px-4 py-3">{String(row.metric).replaceAll("_", " ")}</td>
+                    <td className="px-4 py-3 tabular-nums">{typeof row.estimate === "number" ? row.estimate.toFixed(3) : "Unavailable"}</td>
+                    <td className="px-4 py-3 tabular-nums">
+                      {typeof row.ci_low === "number" && typeof row.ci_high === "number"
+                        ? `[${row.ci_low.toFixed(3)}, ${row.ci_high.toFixed(3)}]`
+                        : "Insufficient paired evidence"}
+                    </td>
+                    <td className="px-4 py-3">{row.n_races ?? "Unavailable"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <Card className="p-6 text-sm text-fog">
+            No paired comparison has been saved for this forecast. No claim of beating the grid or best baseline
+            can be made from an absolute score alone.
+          </Card>
+        )}
+      </Section>
 
       <Section eyebrow="Calibration" title="Are the odds honest?">
         {reliability.length ? (

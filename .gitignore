@@ -6,3 +6,16 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*.local.parameters.json
+release-state.json
+rollback-state.json
+infra/azure/*.arm.json
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+!infra/azure/staging.tfvars.json
+*.local.hcl
+crash.log

@@ -78,21 +78,30 @@ class MainPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Partially observed"):
             pipeline._evaluate(frame, "race", 2026, 10, "post_quali")
 
-    def test_collection_starts_in_2021_and_selects_only_related_rounds(self):
+    def test_collection_starts_in_2021_and_expands_recent_results(self):
         schedule = pd.DataFrame([dict(RoundNumber=i, EventName=f"Round {i}") for i in (1, 2, 3)])
+        saved = set()
+
+        def missing_event(year, event):
+            return set() if (year, event.RoundNumber) in saved else {"R"}
+
+        def save_event(year, name, **options):
+            saved.add((year, options["event"].RoundNumber))
+
         with tempfile.TemporaryDirectory() as directory:
             with patch("main.RAW_DATA_DIR", Path(directory)), patch(
                 "main.fastf1.get_event_schedule", return_value=schedule
             ), patch.object(pipeline, "_missing_sessions") as missing:
                 # Each event initially lacks R; the post-collection check confirms it was saved.
-                missing.side_effect = [{"R"}, set()] * 8
-                with patch("main.collect_event") as collect, patch(
+                missing.side_effect = missing_event
+                with patch("main.collect_event", side_effect=save_event) as collect, patch(
                     "main.collect_driver_constructor_stats"
                 ) as stats:
                     pipeline.collect_historical_data(2023, "Round 2")
         self.assertEqual([(c.args[0], c.args[1]) for c in collect.call_args_list],
-                         [(year, f"Round {round_number}") for year in (2021, 2022, 2023)
-                          for round_number in (1, 2)])
+                         [(2021, "Round 1"), (2021, "Round 2")] +
+                         [(year, f"Round {round_number}") for year in (2022, 2023)
+                          for round_number in (1, 2, 3)])
         self.assertTrue(all(c.kwargs["raise_on_failure"] for c in collect.call_args_list))
         self.assertTrue(all(c.kwargs["session_types"] == {"R"} for c in collect.call_args_list))
         stats.assert_called_once_with()

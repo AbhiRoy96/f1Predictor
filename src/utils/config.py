@@ -1,6 +1,7 @@
 """Configuration management for F1 Race Intelligence and Prediction."""
 
 from pathlib import Path
+import os
 
 # Base Paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -10,6 +11,7 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 TRAINING_DATA_DIR = DATA_DIR / "training"
 PREDICTIONS_DATA_DIR = DATA_DIR / "predictions"
 CACHE_DIR = DATA_DIR / "cache"
+FASTF1_CACHE_DIR = Path(os.environ.get("FASTF1_CACHE_DIR", str(CACHE_DIR / "fastf1")))
 MODELS_DIR = PROJECT_ROOT / "models"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 
@@ -20,6 +22,7 @@ for path in (
     TRAINING_DATA_DIR,
     PREDICTIONS_DATA_DIR,
     CACHE_DIR,
+    FASTF1_CACHE_DIR,
     MODELS_DIR,
     REPORTS_DIR,
 ):
@@ -48,6 +51,7 @@ METADATA_COLUMNS = [
     "weekend_source_session_types",
     "news_source_max_utc",
     "grid_source_max_utc",
+    "GridPublishedAt",
 ]
 
 TARGET_COLUMNS = [

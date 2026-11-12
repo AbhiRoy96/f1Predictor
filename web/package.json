@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "test": "node --test",
     "export-data": "cd .. && python -m scripts.export_web_data --demo"
   },
   "license": "MIT",

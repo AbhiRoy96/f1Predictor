@@ -108,6 +108,12 @@ class ObservabilityTests(unittest.TestCase):
         with patch.dict(os.environ, {"ML_COMPUTE_HOURLY_USD": "0"}):
             self.assertEqual(compute_rate(), 0)
 
+    def test_hosted_telemetry_requires_an_explicit_endpoint(self):
+        with patch.dict(os.environ, {"HOSTED_MODE": "true", "OTEL_ENABLED": "true"}):
+            os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+            with self.assertRaisesRegex(RuntimeError, "explicit controlled OTLP endpoint"):
+                telemetry.configure("gridcast-api")
+
     def test_query_spans_have_outcomes_but_not_query_text_or_parameters(self):
         _, engine = self.make_app()
         with patch.object(telemetry, "_initialized", True):
@@ -167,7 +173,7 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(job["payload"], {"year": 2024})
             self.assertEqual(job["status"], "queued")
             self.assertIsNone(job["trace_context"])
-            self.assertEqual(connection.scalars(select(schema_versions.c.version)).all(), [1, 2])
+            self.assertEqual(connection.scalars(select(schema_versions.c.version)).all(), [1, 2, 3, 4])
 
     def test_disabled_gpu_has_no_invented_measurements(self):
         runtime = RuntimeMetrics(Mock())
@@ -206,11 +212,12 @@ class ObservabilityTests(unittest.TestCase):
         root = Path(__file__).parents[2] / "web"
         css = (root / "src" / "app" / "globals.css").read_text(encoding="utf-8")
         config = (root / "next.config.mjs").read_text(encoding="utf-8")
-        self.assertIn('url("/fonts/Formula1-Bold.woff2")', css)
+        self.assertNotIn("Formula1-Bold", css)
+        self.assertIn('"Noto Sans Variable"', css)
         self.assertIn('font-style: normal', css)
         self.assertNotIn('font-style: italic', css)
-        self.assertIn('source: "/fonts/Formula1-Bold.woff2"', config)
-        self.assertIn("https://www.formula1.com/s/fonts/formula1/Formula1-Bold.woff2", config)
+        self.assertNotIn("Formula1-Bold", config)
+        self.assertNotIn("formula1.com", config)
         self.assertFalse((root / "src" / "app" / "method" / "page.tsx").exists())
 
 

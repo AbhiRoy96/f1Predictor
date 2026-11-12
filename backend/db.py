@@ -1,11 +1,22 @@
-"""Database schema v2 and shared persistence helpers."""
+"""Database schema and shared persistence helpers."""
 
 import os
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    JSON, Column, DateTime, Integer, MetaData, String, Table, Text,
-    create_engine, func, inspect, select, text,
+    JSON,
+    Column,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    func,
+    inspect,
+    select,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
@@ -32,6 +43,11 @@ settings = Table(
     Column("id", Integer, primary_key=True),
     Column("payload", json_type, nullable=False),
 )
+provider_credentials = Table(
+    "provider_credentials", metadata,
+    Column("provider", String(32), primary_key=True),
+    Column("ciphertext", Text, nullable=False),
+)
 jobs = Table(
     "jobs", metadata,
     Column("id", String(36), primary_key=True),
@@ -44,6 +60,15 @@ jobs = Table(
     Column("run_id", String(160)),
     Column("error", Text),
     Column("trace_context", json_type),
+    Column("owner", String(64)),
+    Column("request_key", String(64), index=True),
+    Column("heartbeat_at", DateTime(timezone=True)),
+)
+request_limits = Table(
+    "request_limits", metadata,
+    Column("id", String(80), primary_key=True),
+    Column("window_start", DateTime(timezone=True), nullable=False),
+    Column("count", Integer, nullable=False),
 )
 
 
@@ -61,14 +86,14 @@ def make_engine(url: str | None = None) -> Engine:
 
 
 def migrate(engine: Engine) -> None:
-    """Apply additive schema migrations, including v2 queue trace propagation."""
-    if engine.dialect.name == "postgresql":
+    """Apply additive schema migrations without requiring server-admin privileges."""
+    if engine.dialect.name == "postgresql" and os.getenv("ENABLE_PG_STAT_STATEMENTS") == "true":
         with engine.begin() as connection:
             connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"))
     metadata.create_all(engine)
     with engine.begin() as connection:
         version = connection.scalar(select(func.max(schema_versions.c.version))) or 0
-        if version > 2:
+        if version > 4:
             raise RuntimeError("Database schema is newer than this application supports.")
         if version < 2:
             columns = {column["name"] for column in inspect(connection).get_columns("jobs")}
@@ -76,6 +101,17 @@ def migrate(engine: Engine) -> None:
                 kind = "JSONB" if engine.dialect.name == "postgresql" else "JSON"
                 connection.execute(text(f"ALTER TABLE jobs ADD COLUMN trace_context {kind}"))
             connection.execute(schema_versions.insert().values(version=2))
+        if version < 3:
+            columns = {column["name"] for column in inspect(connection).get_columns("jobs")}
+            for name, kind in (("owner", "VARCHAR(64)"), ("request_key", "VARCHAR(64)"),
+                               ("heartbeat_at", "TIMESTAMP WITH TIME ZONE" if
+                                engine.dialect.name == "postgresql" else "DATETIME")):
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {kind}"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_request_key ON jobs (request_key)"))
+            connection.execute(schema_versions.insert().values(version=3))
+        if version < 4:
+            connection.execute(schema_versions.insert().values(version=4))
 
 
 def upsert(connection, table: Table, key: dict, values: dict) -> None:

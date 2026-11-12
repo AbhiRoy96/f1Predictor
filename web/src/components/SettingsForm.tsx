@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 
+import { F1AccountForm } from "@/components/F1AccountForm";
 import { api, errorMessage } from "@/lib/api";
 import type { SettingsResponse } from "@/lib/types";
 
@@ -36,6 +37,8 @@ export function SettingsForm() {
   }
 
   return (
+    <>
+    {settings && <F1AccountForm key={JSON.stringify(settings.f1_account)} initialStatus={settings.f1_account} />}
     <section className="mt-8 rounded-xl border border-line bg-asphalt p-6">
       {error && <div role="alert" className="mb-5 text-amber">{error} <button type="button" className="underline" onClick={() => void load()}>Reload settings</button></div>}
       {!settings && !error && <p role="status">Loading settings...</p>}
@@ -60,10 +63,11 @@ export function SettingsForm() {
             onChange={(event) => setSettings({ ...settings, values: { ...settings.values, skip_collection: event.target.checked } })} />
           Use only existing local training data (skip FastF1 collection)
         </label>
-        <p className="text-sm text-fog sm:col-span-2">FastF1 and Jolpica do not currently require provider credentials. Database credentials stay server-side; this page never receives them. Defaults are shared in this private, single-user installation.</p>
+        <p className="text-sm text-fog sm:col-span-2">Prediction defaults are shared in this private, single-user installation. Database credentials stay server-side; this page never receives them.</p>
         <button disabled={busy} className="justify-self-start rounded bg-red px-6 py-3 font-bold disabled:opacity-50">{busy ? "Saving..." : "Save defaults"}</button>
         {message && <p role="status" className="text-sm text-teal sm:col-span-2">{message}</p>}
       </form>}
     </section>
+    </>
   );
 }

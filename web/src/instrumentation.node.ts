@@ -9,6 +9,9 @@ let sdk: NodeSDK | undefined;
 
 export function registerNodeTelemetry() {
   if (sdk) return;
+  if (process.env.HOSTED_MODE === "true" && !process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
+    throw new Error("Hosted telemetry requires an explicit controlled OTLP endpoint.");
+  }
   sdk = new NodeSDK({
     serviceName: process.env.OTEL_SERVICE_NAME ?? "gridcast-web",
     traceExporter: new OTLPTraceExporter(),

@@ -10,10 +10,30 @@ from scipy.special import logsumexp
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from src.observability.operations import observe
 
+CALIBRATION_OBJECTIVE = "final_win_podium_top10_plus_conditional_top10_pl"
+
+
+def top10_pl_nll(scores, finish_order, temperature=1.0):
+    """Top-10 ordered PL loss, retaining unselected entrants in each denominator."""
+    scores = np.asarray(scores, dtype=float)
+    order = np.asarray(finish_order, dtype=int)[:10]
+    if temperature <= 0 or not np.isfinite(temperature) or not np.isfinite(scores).all():
+        raise ValueError("PL scoring requires finite scores and a positive temperature")
+    if len(np.unique(order)) != len(order) or (order < 0).any() or (order >= len(scores)).any():
+        raise ValueError("PL order must contain unique valid entrant indices")
+    remaining = np.ones(len(scores), dtype=bool)
+    scaled = scores / temperature
+    loss = 0.0
+    for entrant in order:
+        loss += logsumexp(scaled[remaining]) - scaled[entrant]
+        remaining[entrant] = False
+    return float(loss)
+
 
 def simulation_log_loss(examples, temperature=1.0, n_simulations=1024, seed=42):
-    """Score final simulated win/podium probabilities, including latent uncertainty."""
+    """Final outcome log losses plus mean conditional-finisher top-10 PL loss."""
     from src.simulation.race_simulator import MonteCarloRaceSimulator, session_scenario
+    from src.data.outcomes import dnf_labels
 
     if not examples:
         raise ValueError("Simulation scoring requires at least one held-out race")
@@ -33,14 +53,21 @@ def simulation_log_loss(examples, temperature=1.0, n_simulations=1024, seed=42):
         winner = int(position.argmin())
         p = np.clip(prediction.podium_probability.to_numpy(), 1e-12, 1 - 1e-12)
         podium = position <= min(3, len(frame))
+        p10 = np.clip(prediction.top10_probability.to_numpy(), 1e-12, 1 - 1e-12)
+        top10 = position <= min(10, len(frame))
+        finishers = np.flatnonzero(dnf_labels(frame)[0].eq(0).to_numpy())
+        finisher_order = np.argsort(position[finishers])
+        pl_loss = top10_pl_nll(np.asarray(example["strength"])[finishers], finisher_order, temperature)
+        pl_loss /= max(1, min(10, len(finishers)))
         values.append(-np.log(np.clip(prediction.win_probability.iloc[winner], 1e-12, 1))
-                      - np.mean(podium * np.log(p) + (~podium) * np.log1p(-p)))
+                      - np.mean(podium * np.log(p) + (~podium) * np.log1p(-p))
+                      - np.mean(top10 * np.log(p10) + (~top10) * np.log1p(-p10)) + pl_loss)
     return float(np.mean(values))
 
 
 @observe("ml.calibrate")
 def fit_simulation_temperature(examples, default=1.0, n_simulations=1024, seed=42):
-    """Fit one scale against final OOF win and podium probabilities.
+    """Fit the PL scale against final OOF win, podium and top-10 probabilities.
 
     Each example supplies past-only strength/risk predictions and a complete
     held-out race. Common random numbers make candidate comparisons repeatable.
@@ -90,7 +117,7 @@ def fit_pl_temperature(scores_by_race, orders, default=1.0):
     if not usable:
         return float(default)
     return float(minimize_scalar(
-        lambda temperature: np.mean([pl_nll(s, order, temperature) for s, order in usable]),
+        lambda temperature: np.mean([top10_pl_nll(s, order, temperature) for s, order in usable]),
         bounds=(0.3, 5.0), method="bounded").x)
 
 

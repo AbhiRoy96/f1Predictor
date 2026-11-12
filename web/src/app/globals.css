@@ -1,13 +1,5 @@
 @import "tailwindcss";
 
-@font-face {
-  font-family: "Formula1 Bold";
-  src: url("/fonts/Formula1-Bold.woff2") format("woff2");
-  font-weight: 700;
-  font-style: normal;
-  font-display: swap;
-}
-
 @theme {
   --color-track: #15151e;
   --color-asphalt: #1f1f2b;
@@ -19,7 +11,7 @@
   --color-red-deep: #a10400;
   --color-amber: #ffb800;
   --color-teal: #00d2be;
-  --font-display: "Formula1 Bold", "Noto Sans Variable", "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Noto Sans Variable", "Noto Sans", "Helvetica Neue", Arial, sans-serif;
   --font-sans: "Noto Sans Variable", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
 }
 

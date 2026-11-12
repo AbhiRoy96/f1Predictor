@@ -1,17 +1,33 @@
 """Run with flask --app backend.app:create_app run, or Gunicorn in a container."""
 
+import hashlib
+import hmac
+import json
+import os
 import re
+from datetime import timedelta, timezone
 from uuid import uuid4
 
 import click
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
+from opentelemetry import metrics
+from opentelemetry.propagate import inject
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import HTTPException
-from opentelemetry import metrics
-from opentelemetry.propagate import inject
 
-from backend.db import jobs, make_engine, migrate, runs, seasons, settings, upsert, utcnow
+from backend.credentials import CredentialsError, account_status, save_account
+from backend.db import (
+    jobs,
+    make_engine,
+    migrate,
+    request_limits,
+    runs,
+    seasons,
+    settings,
+    upsert,
+    utcnow,
+)
 from backend.options import CHOICES, DEFAULTS, LIMITS, validate_options, validate_year
 from src.observability.telemetry import configure
 
@@ -21,9 +37,16 @@ SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,160}$")
 def create_app(config: dict | None = None) -> Flask:
     telemetry_enabled = configure("gridcast-api")
     app = Flask(__name__)
-    app.config.update(MAX_CONTENT_LENGTH=16384)
+    app.config.update(
+        MAX_CONTENT_LENGTH=16384, HOSTED_MODE=os.getenv("HOSTED_MODE") == "true",
+        PROXY_AUTH_TOKEN=os.getenv("PROXY_AUTH_TOKEN", ""),
+        USER_QUEUE_LIMIT=3, QUEUE_LIMIT=10, FRESH_RUN_SECONDS=3600,
+        SYNC_INTERVAL_SECONDS=3600, WRITE_RATE_PER_MINUTE=20,
+    )
     if config:
         app.config.update(config)
+    if app.config["HOSTED_MODE"] and len(app.config["PROXY_AUTH_TOKEN"]) < 32:
+        raise RuntimeError("Hosted API requires a PROXY_AUTH_TOKEN of at least 32 characters.")
     engine = make_engine(app.config.get("DATABASE_URL"))
     app.extensions["db"] = engine
     if telemetry_enabled:
@@ -45,6 +68,11 @@ def create_app(config: dict | None = None) -> Flask:
         app.logger.exception("Database request failed")
         return jsonify(error="Database unavailable or schema missing. Check backend logs and run db-init."), 503
 
+    @app.errorhandler(CredentialsError)
+    def credentials_error(error):
+        app.logger.error("F1 credential configuration failed: %s", error)
+        return jsonify(error=str(error)), 503
+
     @app.errorhandler(Exception)
     def unexpected_error(error):
         app.logger.exception("Unexpected API error")
@@ -52,10 +80,44 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.before_request
     def require_json_writes():
+        if request.path == "/api/health":
+            return None
+        if app.config["HOSTED_MODE"]:
+            token = request.headers.get("X-Gridcast-Proxy-Token", "")
+            owner = request.headers.get("X-Gridcast-User", "")
+            if (not hmac.compare_digest(token, app.config["PROXY_AUTH_TOKEN"])
+                    or not re.fullmatch(r"[a-f0-9]{64}", owner)):
+                app.logger.warning("Rejected unauthenticated API request")
+                return jsonify(error="Authentication required."), 401
+            g.owner = owner
+            g.client_ip = request.headers.get("X-Gridcast-Client-IP", owner)
+            if not re.fullmatch(r"[a-f0-9]{64}", g.client_ip):
+                return jsonify(error="Invalid client identity."), 401
+        else:
+            g.owner = hashlib.sha256((request.remote_addr or "local").encode()).hexdigest()
+            g.client_ip = g.owner
         # Browsers cannot issue cross-origin JSON writes without a preflight.
         # No CORS is enabled; Next.js proxies same-origin requests.
         if request.method in {"POST", "PUT"} and not request.is_json:
             return jsonify(error="Content-Type must be application/json."), 415
+        if request.method in {"POST", "PUT"}:
+            now = utcnow()
+            with engine.begin() as connection:
+                if engine.dialect.name == "postgresql":
+                    connection.execute(text("SELECT pg_advisory_xact_lock(716420)"))
+                for identity in {g.owner, g.client_ip}:
+                    key = f"write:{identity}"
+                    row = connection.execute(select(request_limits).where(
+                        request_limits.c.id == key)).mappings().first()
+                    start = row["window_start"].replace(tzinfo=timezone.utc) if row else now
+                    count = row["count"] if row and now - start < timedelta(minutes=1) else 0
+                    if count >= app.config["WRITE_RATE_PER_MINUTE"]:
+                        app.logger.warning("API write rate limit exceeded")
+                        return jsonify(error="Too many writes. Retry in a minute."), 429, {"Retry-After": "60"}
+                    upsert(connection, request_limits, {"id": key},
+                           {"window_start": start if count else now, "count": count + 1})
+                connection.execute(request_limits.delete().where(
+                    request_limits.c.window_start < now - timedelta(days=1)))
 
     @app.get("/api/health")
     def health():
@@ -86,7 +148,16 @@ def create_app(config: dict | None = None) -> Flask:
         with engine.connect() as connection:
             saved = connection.scalar(select(settings.c.payload).where(settings.c.id == 1))
         return jsonify(values=saved or DEFAULTS, choices=CHOICES, limits=LIMITS,
-                       credentials_required=False)
+                       credentials_required=False,
+                       f1_account=account_status(engine, hosted=app.config["HOSTED_MODE"]))
+
+    @app.put("/api/settings/f1-account")
+    def put_f1_account():
+        if app.config["HOSTED_MODE"]:
+            return jsonify(error="F1 account editing is disabled in hosted mode. Use administrator-managed secrets."), 403
+        save_account(engine, request.get_json())
+        app.logger.info("Saved F1 account configuration updated")
+        return jsonify(f1_account=account_status(engine, hosted=False))
 
     @app.put("/api/settings")
     def put_settings():
@@ -96,19 +167,55 @@ def create_app(config: dict | None = None) -> Flask:
         return jsonify(values=values)
 
     def enqueue(kind: str, payload: dict):
+        request_key = hashlib.sha256(json.dumps(
+            {"kind": kind, "payload": {key: value for key, value in payload.items()
+                                       if key not in {"n_simulations", "events_per_season", "skip_collection",
+                                                      "source_published_at_utc"}}},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         with engine.begin() as connection:
             # Serialize enqueue requests to enforce the queue cap across API workers.
             if engine.dialect.name == "postgresql":
                 connection.execute(text("SELECT pg_advisory_xact_lock(716420)"))
+            existing = connection.execute(select(jobs).where(
+                jobs.c.request_key == request_key,
+                jobs.c.owner == g.owner,
+                jobs.c.status.in_(("queued", "running", "succeeded")))
+                .order_by(jobs.c.created_at.desc()).limit(1)).mappings().first()
+            if existing and (existing["status"] in {"queued", "running"} or (
+                    existing["payload"] == payload and existing["finished_at"]
+                    and utcnow() - existing["finished_at"].replace(
+                        tzinfo=timezone.utc) < timedelta(seconds=app.config["FRESH_RUN_SECONDS"]))):
+                return jsonify(id=existing["id"], status=existing["status"],
+                               run_id=existing["run_id"], reused=True), (
+                                   200 if existing["status"] == "succeeded" else 202)
+            if kind == "season_sync":
+                syncing = connection.scalar(select(jobs.c.id).where(
+                    jobs.c.kind == "season_sync", jobs.c.status.in_(("queued", "running"))).limit(1))
+                recent = connection.scalar(select(jobs.c.id).where(
+                    jobs.c.kind == "season_sync",
+                    jobs.c.payload["year"].as_integer() == payload["year"],
+                    jobs.c.created_at > utcnow() - timedelta(seconds=app.config["SYNC_INTERVAL_SECONDS"])
+                ).limit(1))
+                if syncing or recent:
+                    return jsonify(error="Season sync is active or this season was requested recently."), 429
+            else:
+                active = connection.scalar(select(jobs.c.id).where(
+                    jobs.c.request_key == request_key,
+                    jobs.c.status.in_(("queued", "running"))).limit(1))
+                if active:
+                    return jsonify(error="An identical forecast is already queued or running."), 409
             count = connection.scalar(select(func.count()).select_from(jobs).where(
                 jobs.c.status.in_(("queued", "running"))))
-            if count >= 10:
+            owned = connection.scalar(select(func.count()).select_from(jobs).where(
+                jobs.c.owner == g.owner, jobs.c.status.in_(("queued", "running"))))
+            if count >= app.config["QUEUE_LIMIT"] or owned >= app.config["USER_QUEUE_LIMIT"]:
                 return jsonify(error="Job queue is full. Wait for existing jobs to finish."), 429
             job_id = str(uuid4())
             carrier = {}
             inject(carrier)
             connection.execute(jobs.insert().values(
                 id=job_id, kind=kind, status="queued", payload=payload, created_at=utcnow(),
+                owner=g.owner, request_key=request_key,
                 trace_context={key: value for key, value in carrier.items()
                                if key in {"traceparent", "tracestate"}}))
         metrics.get_meter("gridcast.queue").create_counter("gridcast.jobs.enqueued").add(1, {"job.kind": kind})
@@ -127,16 +234,20 @@ def create_app(config: dict | None = None) -> Flask:
     @app.get("/api/jobs")
     def list_jobs():
         with engine.connect() as connection:
-            rows = connection.execute(select(jobs).order_by(jobs.c.created_at.desc()).limit(50)).mappings()
-            return jsonify([dict(row) for row in rows])
+            rows = connection.execute(select(jobs).where(jobs.c.owner == g.owner)
+                                      .order_by(jobs.c.created_at.desc()).limit(50)).mappings()
+            return jsonify([{key: value for key, value in row.items()
+                             if key not in {"owner", "request_key", "trace_context"}} for row in rows])
 
     @app.get("/api/jobs/<job_id>")
     def get_job(job_id):
         with engine.connect() as connection:
-            row = connection.execute(select(jobs).where(jobs.c.id == job_id)).mappings().first()
+            row = connection.execute(select(jobs).where(
+                jobs.c.id == job_id, jobs.c.owner == g.owner)).mappings().first()
         if row is None:
             return jsonify(error="Job not found."), 404
-        return jsonify(dict(row))
+        return jsonify({key: value for key, value in row.items()
+                        if key not in {"owner", "request_key", "trace_context"}})
 
     @app.get("/api/seasons")
     def list_seasons():
@@ -164,7 +275,7 @@ def create_app(config: dict | None = None) -> Flask:
     def db_init():
         """Apply schema migrations; do not generate or seed data."""
         migrate(engine)
-        click.echo("Database schema is ready (v2).")
+        click.echo("Database schema is ready (v3).")
 
     @app.cli.command("import-data")
     def import_data():

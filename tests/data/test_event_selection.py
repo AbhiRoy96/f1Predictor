@@ -56,7 +56,7 @@ class EventSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_related_events(self.schedule, self.target, 2027, 2026)
 
-    def test_collector_never_downloads_outside_plan_and_reuses_saved_events(self):
+    def test_recent_results_cover_calendar_and_reuse_saved_events(self):
         downloaded = set()
 
         def missing(year, event):
@@ -74,12 +74,12 @@ class EventSelectionTests(unittest.TestCase):
                 "main.collect_driver_constructor_stats"
             ):
                 pipeline.collect_historical_data(2026, "Event 8")
-                self.assertEqual(collector.call_count, 12)
+                self.assertEqual(collector.call_count, 24)
                 pipeline.collect_historical_data(2026, "Event 8")
-                self.assertEqual(collector.call_count, 12)
+                self.assertEqual(collector.call_count, 24)
         for year in (2025, 2026):
-            expected = select_related_events(self.schedule, self.target, year, 2026)
-            self.assertEqual({rnd for y, rnd in downloaded if y == year}, set(expected.RoundNumber))
+            self.assertEqual({rnd for y, rnd in downloaded if y == year}, set(self.schedule.RoundNumber))
+        self.assertTrue(all(call.kwargs["results_only"] for call in collector.call_args_list))
 
     def test_cli_passes_budget_and_explicit_similarity_override(self):
         with patch.object(pipeline, "run_pipeline") as run:

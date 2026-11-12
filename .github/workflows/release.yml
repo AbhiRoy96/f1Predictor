@@ -1,0 +1,102 @@
+name: ACA release
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [Preview, Deploy, Rollback]
+        default: Preview
+      git_sha:
+        description: Immutable commit SHA for both images (previous SHA for rollback)
+        required: true
+      build_images:
+        description: Build SHA-tagged images before Deploy; never used for Preview or Rollback
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: gridcast-aca-staging
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      PREFIX: ${{ vars.ACA_PREFIX }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      ENTRA_CLIENT_ID: ${{ vars.ENTRA_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      RELEASE_SHA: ${{ inputs.git_sha }}
+      OPERATION: ${{ inputs.operation }}
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "true"
+      TF_STATE_RESOURCE_GROUP: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+      TF_STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+      TF_STATE_CONTAINER: ${{ vars.TF_STATE_CONTAINER }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+      TF_VAR_registry_name: ${{ vars.ACR_NAME }}
+      TF_VAR_vault_name: ${{ vars.AZURE_KEY_VAULT }}
+      TF_VAR_storage_account_name: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - shell: pwsh
+        run: |
+          foreach ($value in @($env:TF_STATE_RESOURCE_GROUP, $env:TF_STATE_STORAGE_ACCOUNT,
+              $env:TF_STATE_CONTAINER, $env:TF_STATE_KEY)) {
+            if ([string]::IsNullOrWhiteSpace($value)) { throw 'Terraform app backend variables are required.' }
+          }
+          terraform -chdir=infra/azure/apps init -input=false `
+            "-backend-config=resource_group_name=$env:TF_STATE_RESOURCE_GROUP" `
+            "-backend-config=storage_account_name=$env:TF_STATE_STORAGE_ACCOUNT" `
+            "-backend-config=container_name=$env:TF_STATE_CONTAINER" `
+            "-backend-config=key=$env:TF_STATE_KEY" -backend-config=use_oidc=true
+          if ($LASTEXITCODE) { throw 'Terraform backend initialization failed.' }
+      - shell: pwsh
+        run: |
+          if ($env:RELEASE_SHA -notmatch '^[a-f0-9]{40}$') { throw 'A full git SHA is required.' }
+      - uses: actions/checkout@v4
+        if: inputs.operation == 'Deploy' && inputs.build_images
+        with:
+          ref: ${{ inputs.git_sha }}
+          path: release-source
+      - if: inputs.operation == 'Deploy' && inputs.build_images
+        shell: pwsh
+        run: |
+          az acr build --registry $env:ACR_NAME --platform linux/amd64 --image "gridcast-api:$env:RELEASE_SHA" ./release-source
+          if ($LASTEXITCODE) { throw 'API image build failed.' }
+          az acr build --registry $env:ACR_NAME --platform linux/amd64 --image "gridcast-web:$env:RELEASE_SHA" ./release-source/web
+          if ($LASTEXITCODE) { throw 'Web image build failed.' }
+          foreach ($image in @('gridcast-api', 'gridcast-web')) {
+            az acr repository update --name $env:ACR_NAME --image "${image}:$env:RELEASE_SHA" --write-enabled false --delete-enabled false
+            if ($LASTEXITCODE) { throw 'Could not protect release image tag.' }
+          }
+      - shell: pwsh
+        run: |
+          $parameters = "$env:RUNNER_TEMP/staging.tfvars.json"
+          '{}' | Set-Content -LiteralPath $parameters
+          if (Test-Path infra/azure/staging.tfvars.json) {
+            $parameters = 'infra/azure/staging.tfvars.json'
+          }
+          ./scripts/Deploy-Aca.ps1 -ResourceGroup $env:RESOURCE_GROUP -Prefix $env:PREFIX `
+            -ReleaseTag $env:RELEASE_SHA -EntraClientId $env:ENTRA_CLIENT_ID `
+            -EntraTenantId $env:AZURE_TENANT_ID -Operation $env:OPERATION `
+            -StatePath "$env:RUNNER_TEMP/release-state.json" -ParametersFile $parameters
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.operation != 'Preview'
+        with:
+          name: release-state
+          path: ${{ runner.temp }}/release-state.json
+          if-no-files-found: warn
