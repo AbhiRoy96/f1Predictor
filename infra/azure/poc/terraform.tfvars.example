@@ -1,0 +1,3 @@
+resource_group_name = "gridcast-minpoc-rg"
+prefix              = "gridcast-minpoc"
+is_public_poc       = true

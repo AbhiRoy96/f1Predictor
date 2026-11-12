@@ -66,12 +66,17 @@ jobs:
       - run: terraform -chdir=infra/azure/apps validate
       - run: terraform -chdir=infra/azure/foundation test
       - run: terraform -chdir=infra/azure/apps test
+      - run: terraform -chdir=infra/azure/poc init -backend=false -input=false
+      - run: terraform -chdir=infra/azure/poc validate
+      - run: terraform -chdir=infra/azure/poc test
       - shell: pwsh
         run: |
           $tokens = $null; $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            "$PWD/scripts/Deploy-Aca.ps1", [ref]$tokens, [ref]$errors) | Out-Null
-          if ($errors.Count) { throw ($errors | Out-String) }
+          foreach ($script in @('Deploy-Aca.ps1', 'Deploy-MinimalPoc.ps1')) {
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              "$PWD/scripts/$script", [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

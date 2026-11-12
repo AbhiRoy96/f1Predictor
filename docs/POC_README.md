@@ -1,4 +1,7 @@
-# Gridcast PoC: 100% Azure Container Apps (ACA) Deployment Guide
+---
+title: Gridcast PoC Azure Container Apps deployment guide
+description: Architecture options and an isolated Terraform implementation for a bare-minimum PoC.
+---
 
 This document outlines the **Current State** and **Proposed PoC Architecture** for deploying Gridcast (Next.js frontend, Flask API, background simulation worker, schema migration job, and PostgreSQL 17 database) entirely within **Azure Container Apps (ACA)**.
 
@@ -107,6 +110,17 @@ The objective of this Proof of Concept (PoC) is to evaluate an all-in-one contai
 ---
 
 ### 4. Bare Minimum PoC: ACA, ACR & Storage Account Only
+
+Use the [isolated Terraform implementation](../infra/azure/poc/README.md) for this
+configuration. It preserves the existing staging roots, requires acknowledgement
+of public unauthenticated access, and gates app rollout on successful schema
+initialization. Unlike the Bash sketch below, it uses PostgreSQL Alpine UID/GID 70
+and the API's internal HTTPS ingress FQDN. Only the PostgreSQL share is persistent;
+worker artifacts are ephemeral. This is a disposable PoC, not production hosting.
+
+Use the [PowerShell running guide](RUN_MINIMAL_POC.md) to deploy this Terraform
+configuration with [Deploy-MinimalPoc.ps1](../scripts/Deploy-MinimalPoc.ps1).
+The Bash script below is an architecture sketch, not the Terraform runner.
 
 To maximize deployment velocity, minimize resource overhead, and eliminate external dependencies, this **bare minimum configuration** provisions strictly three Azure resource types:
 

@@ -5,6 +5,10 @@ description: Private staging infrastructure, ordered releases, OIDC CI and requi
 
 ## What is deployed
 
+For section 4's unauthenticated bare-minimum PoC (ACA, ACR and one PostgreSQL file
+share only), use the separate [PoC Terraform root](poc/README.md). It uses isolated
+state and does not replace the staging resources described below.
+
 The [Terraform foundation](foundation/main.tf) creates a VNet-integrated ACA Consumption environment,
 private PostgreSQL 17 on port 5432, fourteen-day database backups, a Basic registry,
 three worker-only Azure Files shares, a purge-protected RBAC Key Vault, and separate

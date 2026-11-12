@@ -195,6 +195,240 @@ try {
         self.assertFalse(any("job start" in call or "--type external" in call for call in result["calls"]))
 
 
+@unittest.skipUnless(POWERSHELL, "PowerShell 7 is needed for offline PoC runner tests")
+class MinimalPocContracts(unittest.TestCase):
+    def run_poc(self, scenario="success"):
+        script = str(ROOT / "scripts" / "Deploy-MinimalPoc.ps1").replace("'", "''")
+        harness = r"""
+. '__SCRIPT__' -SubscriptionId '00000000-0000-0000-0000-000000000001' `
+    -ResourceGroup test-poc -Prefix gridcast-poc -AcknowledgePublicAccess -AutoApprove `
+    -DatabasePassword (ConvertTo-SecureString ('p' * 24) -AsPlainText -Force)
+$Scenario = '__SCENARIO__'
+$Calls = [System.Collections.Generic.List[string]]::new()
+$Plans = @{}
+$NativeInvoker = ${function:Invoke-PocNative}
+$RevisionWaiter = ${function:Wait-PocRevision}
+$Polls = 0
+$ReadyPolls = 0
+$ActivePolls = 0
+$env:ARM_SUBSCRIPTION_ID = 'previous-subscription'
+$env:ARM_TENANT_ID = 'previous-tenant'
+$env:TF_VAR_database_password = 'previous-password'
+$env:TF_VAR_initialized_release_tag = 'untrusted-old-gate'
+$PipIndexUrl = ''
+if ($Scenario -eq 'no-opt-in') { $AcknowledgePublicAccess = $false }
+if ($Scenario -eq 'declined-plan') { $AutoApprove = $false }
+if ($Scenario -eq 'build') {
+    $BuildImages = $true
+    $PipIndexUrl = 'https://packages.example/simple/'
+}
+function Get-Command { param([string]$Name) }
+function Invoke-PocNative {
+    param([string]$Command, [string[]]$Arguments, [switch]$Capture)
+    $Call = "$Command $($Arguments -join ' ')"
+    $Calls.Add($Call)
+    if ($Command -eq 'git') { return ('a' * 40) }
+    if ($Command -eq 'docker') {
+        if ($Arguments[0] -eq 'push' -and $Scenario -eq 'push-failure') { throw 'docker push failed' }
+        if ($Call -like '*image inspect*') {
+            if ($Scenario -eq 'wrong-platform') { return 'linux/arm64' }
+            return 'linux/amd64'
+        }
+        return
+    }
+    if ($Command -eq 'terraform') {
+        $Subcommand = $Arguments[1]
+        if ($Subcommand -eq 'plan') {
+            $PlanPath = ($Arguments | Where-Object { $_ -like '-out=*' }).Substring(5)
+            $Plans[$PlanPath] = if ($Arguments -contains '-target=azapi_resource.init') { 'init' }
+                elseif ($Arguments -contains '-target=azurerm_container_registry.main') { 'foundation' }
+                else { 'apps' }
+        }
+        if ($Subcommand -eq 'show') {
+            $Kind = $Plans[$Arguments[-1]]
+            $Actions = @('create')
+            $Address = 'azurerm_container_registry.main'
+            if ($Scenario -eq 'replacement') { $Actions = @('delete', 'create') }
+            if ($Scenario -eq 'database-update' -and $Kind -eq 'init') {
+                $Actions = @('update')
+                $Address = 'azapi_resource.postgres'
+            }
+            return (@{resource_changes=@(@{address=$Address;change=@{actions=$Actions}})} |
+                ConvertTo-Json -Depth 10 -Compress)
+        }
+        if ($Subcommand -eq 'apply') {
+            $Calls.Add("apply $($Plans[$Arguments[-1]])")
+            return
+        }
+        if ($Subcommand -eq 'output') {
+            return @{
+                registry_name='crtest';registry_login_server='crtest.azurecr.io'
+                init_job_name='gridcast-poc-db-init';web_url='https://poc.example'
+            }[$Arguments[-1]]
+        }
+        return
+    }
+    if ($Call -like 'az acr login*') {
+        if ($Capture) { return 'Login Succeeded' }
+        Write-Host 'Login Succeeded'
+        return
+    }
+    if ($Call -like 'az account show*') { return '{"tenantId":"test-tenant"}' }
+    if ($Call -like 'az containerapp list*') {
+        if ($Scenario -eq 'first-deployment') { return '[]' }
+        return '[{"name":"gridcast-poc-worker"}]'
+    }
+    if ($Call -like 'az containerapp revision list*') {
+        return '[{"name":"old-worker","properties":{"active":true}}]'
+    }
+    if ($Call -like 'az containerapp show*') {
+        $script:ReadyPolls++
+        $Revision = if ($script:ReadyPolls -eq 1) { 'old-worker' } else { 'gridcast-poc-worker--' + ('a' * 40) }
+        return (@{properties=@{provisioningState='Succeeded';latestReadyRevisionName=$Revision}} |
+            ConvertTo-Json -Compress)
+    }
+    if ($Call -like 'az containerapp revision show*') {
+        $script:ActivePolls++
+        return (@{properties=@{active=($script:ActivePolls -gt 1)}} | ConvertTo-Json -Compress)
+    }
+    if ($Call -like 'az containerapp replica list*') {
+        if ($Scenario -eq 'readiness') { return '[{"name":"new-worker-replica"}]' }
+        return '[]'
+    }
+    if ($Call -like 'az containerapp job start*') {
+        if ($Scenario -eq 'missing-execution') { return '{}' }
+        return '{"name":"current-init-execution"}'
+    }
+    if ($Call -like 'az containerapp job execution show*') {
+        if ($Scenario -eq 'migration-failure') { return '{"properties":{"status":"Failed"}}' }
+        $script:Polls++
+        if ($script:Polls -eq 1) { return '{"properties":{"status":"Running"}}' }
+        return '{"properties":{"status":"Succeeded"}}'
+    }
+    return '{}'
+}
+function Wait-PocRevision {
+    param([string]$Name, [string]$Tag)
+    $Calls.Add("ready $Name--$Tag")
+}
+function Invoke-WebRequest {
+    param([string]$Uri, [switch]$SkipHttpErrorCheck, [int]$TimeoutSec)
+    $Calls.Add("http $Uri")
+    return [pscustomobject]@{StatusCode=$(if ($Scenario -eq 'health-failure') {503} else {200})}
+}
+function Start-Sleep { param([int]$Seconds) }
+function Read-Host { param([string]$Prompt) return 'n' }
+$Url = $null
+$Failure = $null
+try {
+    if ($Scenario -eq 'native-failure') {
+        & $NativeInvoker -Command '__POWERSHELL__' -Arguments @('-NoProfile', '-Command', 'exit 7') -Capture
+    } elseif ($Scenario -eq 'readiness') {
+        & $RevisionWaiter -Name 'gridcast-poc-worker' -Tag ('a' * 40)
+    } else {
+        $Url = Invoke-PocDeployment
+    }
+} catch { $Failure = $_.Exception.Message }
+@{
+    url=$Url;error=$Failure;calls=$Calls
+    environment=@($env:ARM_SUBSCRIPTION_ID,$env:ARM_TENANT_ID,
+        $env:TF_VAR_database_password,$env:TF_VAR_initialized_release_tag)
+    remainingPlans=@($Plans.Keys | Where-Object { Test-Path -LiteralPath $_ })
+} | ConvertTo-Json -Depth 10 -Compress
+"""
+        harness = (harness.replace("__SCRIPT__", script).replace("__SCENARIO__", scenario)
+                   .replace("__POWERSHELL__", POWERSHELL.replace("'", "''")))
+        completed = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", harness],
+            check=True, text=True, capture_output=True, timeout=30,
+        )
+        return json.loads(completed.stdout.splitlines()[-1])
+
+    def test_orders_bootstrap_push_stop_migration_and_full_rollout(self):
+        result = self.run_poc()
+        self.assertIsNone(result["error"])
+        calls = result["calls"]
+        foundation = calls.index("apply foundation")
+        pushes = [i for i, call in enumerate(calls) if call.startswith("docker push")]
+        stop = next(i for i, call in enumerate(calls) if "revision deactivate" in call)
+        init = calls.index("apply init")
+        polls = [i for i, call in enumerate(calls) if "job execution show" in call]
+        apps = calls.index("apply apps")
+        activate = next(i for i, call in enumerate(calls) if "revision activate" in call)
+        self.assertEqual(len(pushes), 2)
+        self.assertLess(foundation, min(pushes))
+        self.assertLess(max(pushes), stop)
+        self.assertLess(stop, init)
+        self.assertEqual(len(polls), 2)
+        self.assertLess(init, min(polls))
+        self.assertLess(max(polls), apps)
+        self.assertLess(apps, activate)
+        self.assertTrue(all("--job-execution-name current-init-execution" in calls[i] for i in polls))
+        plans = [call for call in calls if " plan " in call]
+        self.assertIn("-var=initialized_release_tag=" + "a" * 40, plans[-1])
+        self.assertNotIn("-target=", plans[-1])
+        self.assertFalse(any("untrusted-old-gate" in call for call in calls))
+        self.assertTrue(all("--subscription " in call for call in calls if call.startswith("az ")))
+        self.assertEqual(result["url"], "https://poc.example")
+        self.assertEqual(calls[-2:], ["http https://poc.example/health", "http https://poc.example/api/health"])
+        self.assertEqual(len([call for call in calls if call.startswith("ready ")]), 3)
+
+    def test_first_deployment_and_optional_linux_builds(self):
+        for scenario in ("first-deployment", "build"):
+            with self.subTest(scenario=scenario):
+                result = self.run_poc(scenario)
+                self.assertIsNone(result["error"])
+                if scenario == "first-deployment":
+                    self.assertFalse(any("revision deactivate" in call for call in result["calls"]))
+                else:
+                    builds = [call for call in result["calls"] if call.startswith("docker build")]
+                    self.assertEqual(len(builds), 2)
+                    self.assertTrue(all("--platform linux/amd64" in call for call in builds))
+                    self.assertIn("PIP_INDEX_URL=https://packages.example/simple/", builds[0])
+
+    def test_failures_block_later_stages_and_restore_credentials(self):
+        for scenario in ("push-failure", "migration-failure", "missing-execution",
+                         "replacement", "database-update", "health-failure", "declined-plan"):
+            with self.subTest(scenario=scenario):
+                result = self.run_poc(scenario)
+                self.assertIsNotNone(result["error"])
+                self.assertIsNone(result["url"])
+                self.assertEqual(result["remainingPlans"], [])
+                self.assertEqual(result["environment"], [
+                    "previous-subscription", "previous-tenant", "previous-password", "untrusted-old-gate",
+                ])
+                if scenario != "health-failure":
+                    self.assertNotIn("apply apps", result["calls"])
+                if scenario in ("replacement", "database-update"):
+                    self.assertFalse(any("revision deactivate" in call for call in result["calls"]))
+                if scenario == "push-failure":
+                    self.assertNotIn("apply init", result["calls"])
+                if scenario == "declined-plan":
+                    self.assertFalse(any(call.startswith("apply ") for call in result["calls"]))
+
+    def test_opt_in_and_platform_checks_precede_provisioning(self):
+        for scenario in ("no-opt-in", "wrong-platform"):
+            with self.subTest(scenario=scenario):
+                result = self.run_poc(scenario)
+                self.assertIsNotNone(result["error"])
+                self.assertNotIn("apply foundation", result["calls"])
+                self.assertFalse(any(call.startswith("az group create") for call in result["calls"]))
+        self.assertEqual(self.run_poc("no-opt-in")["calls"], [])
+
+    def test_native_nonzero_exit_is_not_treated_as_success(self):
+        result = self.run_poc("native-failure")
+        self.assertIn("exit code 7", result["error"])
+
+    def test_readiness_waits_past_stale_and_inactive_revisions(self):
+        result = self.run_poc("readiness")
+        self.assertIsNone(result["error"])
+        calls = result["calls"]
+        self.assertEqual(len([call for call in calls if call.startswith("az containerapp show")]), 3)
+        revisions = [call for call in calls if call.startswith("az containerapp revision show")]
+        self.assertEqual(len(revisions), 2)
+        self.assertTrue(all("--revision gridcast-poc-worker--" + "a" * 40 in call for call in revisions))
+
+
 @unittest.skipUnless(POWERSHELL, "PowerShell 7 is needed for offline snapshot retention tests")
 class SnapshotContracts(unittest.TestCase):
     def run_snapshots(self, snapshots, retention="14"):
