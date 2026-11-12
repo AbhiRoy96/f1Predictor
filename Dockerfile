@@ -2,7 +2,9 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONUTF8=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+# Explicitly upgrade zlib from the current Debian security repository; the
+# inherited base-image version is flagged by Trivy (CVE-2026-85091).
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.lock .
 ARG PIP_INDEX_URL=https://pypi.org/simple
