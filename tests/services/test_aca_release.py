@@ -21,6 +21,7 @@ class LockContracts(unittest.TestCase):
             name, version = block.splitlines()[0].split("==", 1)
             self.assertTrue(version.rstrip(" \\"))
             self.assertRegex(block, r"--hash=sha256:[a-f0-9]{64}")
+            self.assertNotRegex(block, r"--hash=(?!sha256:|sha384:|sha512:)")
             packages[name.lower().replace("_", "-")] = version
         for line in (ROOT / "requirements.txt").read_text(encoding="utf-8-sig").splitlines():
             if line.strip() and not line.startswith("#"):

@@ -222,15 +222,31 @@ Worker shutdown, snapshots, auth verification and smoke gates still apply.
 
 The backend Dockerfile and Linux CI install [requirements.lock](../../requirements.lock)
 with `--require-hashes`; [requirements.txt](../../requirements.txt) remains the editable
-development input. The initial lock contains seventy-nine exact versions from the
-existing consistent Linux Python 3.12 runtime, hashed from PyPI, with every direct
-constraint and installed dependency validated. No TLS checks were disabled.
+development input. The lock contains seventy-nine exact versions, resolved for
+Linux Python 3.12 against the selected Microsoft package mirror with SHA-256 hashes.
+Relative to the original lock, mirror availability requires Click `8.5.0`,
+NCCL `2.32.3`, Pydantic `2.14.2`, pydantic-core `2.50.2` and threadpoolctl `3.7.0`.
+Other package versions, including XGBoost, remain unchanged. No TLS or hash checks
+are disabled.
 
-Refresh using a trusted network:
+Set `PIP_INDEX_URL` to your approved index in your local shell and in the ignored
+root `.env` for Compose. The Dockerfile and Compose build already support this
+override. Do not put credentials in the URL or build arguments; authenticated feeds
+require separate secret-based configuration. Your team's CFS-backed Azure Artifacts
+feed takes precedence where required by organizational policy.
+
+Refresh using your approved index:
 
 ```powershell
-python -m uv pip compile requirements.txt --python-version 3.12 --python-platform x86_64-unknown-linux-gnu --generate-hashes -o requirements.lock
+python -m uv pip compile requirements.txt --python-version 3.12 --python-platform x86_64-unknown-linux-gnu --generate-hashes --no-annotate --index-url $env:PIP_INDEX_URL -o requirements.lock
+$lock = Get-Content requirements.lock | Where-Object { $_ -notmatch '^\s+--hash=md5:' }
+$lock | Set-Content -Encoding utf8 requirements.lock
+python -m unittest tests.services.test_aca_release.LockContracts -v
 ```
+
+The mirror can advertise MD5 entries alongside SHA-256; pip rejects MD5 even when
+strong hashes are also present. The normalization removes only MD5 entries, and
+the lock contract verifies that every package retains SHA-256 hashes.
 
 Rebuild, run tests and scans, and retrain models after updates. Artifact loading rejects
 Python/library version mismatches. Reproducible package versions do not pin the base
